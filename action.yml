@@ -1,0 +1,49 @@
+name: "Semfora Gate"
+description: >-
+  Semantic PR gate: checks a pull request against your team's policy in
+  semfora.toml (protected domains, load-bearing edits, new cross-module
+  dependencies, complexity budgets). Runs entirely inside your runner —
+  your code never leaves your infrastructure.
+author: "Semfora"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  semfora-key:
+    description: >-
+      Your Semfora license key (from the semfora.ai dashboard). Required —
+      the action verifies it before running. Store it as a repository or
+      organization secret.
+    required: true
+  base:
+    description: >-
+      Base ref/sha to gate against. Defaults to the pull request base sha
+      from the workflow event.
+    required: false
+  target-ref:
+    description: 'Target ref (default HEAD; "WORKING" for uncommitted changes).'
+    required: false
+    default: "HEAD"
+  engine-path:
+    description: >-
+      Path to a pre-provisioned semfora-engine binary (air-gapped runners /
+      self-hosted mirrors). When set, no download happens; the license key
+      is still verified.
+    required: false
+  api-url:
+    description: "Semfora API base (self-hosted deployments only)."
+    required: false
+    default: "https://semfora.ai"
+
+outputs:
+  verdict:
+    description: '"pass" or "fail" — the gate verdict.'
+  errors:
+    description: "Number of error-severity policy findings."
+  warnings:
+    description: "Number of warning-severity policy findings."
+
+runs:
+  using: "node20"
+  main: "index.js"
