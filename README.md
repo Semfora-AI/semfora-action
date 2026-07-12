@@ -33,16 +33,34 @@ jobs:
           semfora-key: ${{ secrets.SEMFORA_KEY }}
 ```
 
-## PR comments
+## What lands on the PR
 
-By default the action maintains **one sticky comment per PR** with the gate
-report (verdict, error/warning counts, the same markdown as the step
-summary). It is edited in place on every run — pushes never pile up new
-comments, and a comment left by an earlier failing run is refreshed to green
-once the PR is fixed. Grant `pull-requests: write` and tune with
-`pr-comment: on-findings | always | never`. Comments post as
-`github-actions[bot]`; Semfora-branded comments come from the semfora.ai
-cloud gate, not this action.
+With `pull-requests: write` granted, the gate projects its report onto the
+PR itself:
+
+- **Sticky report comment** — one comment per PR, edited in place on every
+  run (pushes never pile up new comments; a red comment refreshes to green
+  once the PR is fixed). It contains a findings table where every location
+  **links to the exact line at the PR's head commit**, plus two generated
+  graphs when the data warrants them: a before/after **cognitive-complexity
+  bar chart** for symbols that blew their budget, and a **module dependency
+  graph** of cross-module edges the PR adds (Mermaid — GitHub renders both
+  natively). Tune with `pr-comment: on-findings | always | never`.
+- **Inline line comments** — each policy finding is commented on the exact
+  line it hit, with the rule, severity, domains, and the measured numbers
+  behind it (`cc=34 cc_before=12 …`). Deduplicated across runs; hits on
+  lines outside the diff stay in the report table (still linked). Disable
+  with `line-comments: "false"`.
+- **Policy denial** — when `semfora.toml` marks a domain protected at
+  `severity = "error"` and the PR touches it, the verdict is fail and the
+  action keeps a **Changes Requested review** on the PR naming the
+  restricted domains. It is dismissed automatically as soon as the gate
+  passes or the failure is waived. Disable with `request-changes: "false"`.
+  Combined with a required status check this is a hard deny: the config in
+  the repo decides, the action enforces.
+
+Comments post as `github-actions[bot]`; Semfora-branded comments come from
+the semfora.ai cloud gate, not this action.
 
 ## Required reviewers
 
@@ -51,8 +69,13 @@ members or repo contributors (and org teams) in `required-reviewers`; when
 the gate fails, the action requests them as reviewers on the PR. With
 `require-approval: "true"`, the failure stays red until one of them approves
 the PR **at its current head commit** — pushing new commits invalidates the
-approval. Mark the check as required in branch protection and those people
-become de-facto required reviewers for protected changes.
+approval, and self-approval never counts. Mark the check as required in
+branch protection and those people become de-facto required reviewers for
+protected changes.
+
+Set `require-approval: "admin"` to restrict the waiver further: only an
+approval from someone with **admin permission on the repo** unblocks a
+policy failure (usable with or without a `required-reviewers` list).
 
 ```yaml
 name: Semfora Gate
@@ -125,16 +148,19 @@ threshold = 40
 | `target-ref` | no | `HEAD` | `WORKING` gates uncommitted changes. |
 | `engine-path` | no | — | Pre-provisioned binary for air-gapped/self-hosted runners (key still verified). |
 | `api-url` | no | `https://semfora.ai` | Self-hosted deployments only (must be https). |
-| `pr-comment` | no | `on-findings` | Sticky PR comment with the report: `on-findings`, `always`, or `never`. Needs `pull-requests: write`. |
+| `pr-comment` | no | `on-findings` | Sticky PR comment with linked findings + graphs: `on-findings`, `always`, or `never`. Needs `pull-requests: write`. |
+| `line-comments` | no | `true` | Inline review comments on the lines the rules hit. Needs `pull-requests: write`. |
+| `request-changes` | no | `true` | Keep a Changes Requested review while policy denies the PR; auto-dismissed on pass/waive. |
 | `required-reviewers` | no | — | Usernames / `org/team` slugs to request as reviewers. Needs `pull-requests: write`. |
 | `request-reviewers-on` | no | `fail` | `fail`, `always`, or `never`. |
-| `require-approval` | no | `false` | `"true"` → a policy failure passes only after a required reviewer approves the head commit. |
+| `require-approval` | no | `false` | `"true"` → a required reviewer must approve the head commit to waive a failure; `"admin"` → the approver must be a repo admin. |
 | `github-token` | no | workflow token | Only set to use a bot/app identity for the review requests. |
 
 ## Outputs
 
 `verdict` (`pass`/`fail`, before any waiver), `errors`, `warnings`,
-`waived` (`true` when an approval waived a policy failure).
+`waived` (`true` when an approval waived a policy failure), and
+`denied-domains` (comma-separated restricted domains hit at error severity).
 
 ## Exit behavior
 

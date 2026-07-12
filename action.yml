@@ -53,11 +53,27 @@ inputs:
     description: >-
       "true" — a policy failure only passes once one of the required
       reviewers approves the PR at its current head commit (stale approvals
-      don't count). Add the `pull_request_review: [submitted]` trigger so
-      the check re-runs when they approve; mark the check required in
-      branch protection to make these reviewers de-facto required.
+      don't count). "admin" — the approval must come from someone with
+      admin permission on the repo. Add the `pull_request_review:
+      [submitted]` trigger so the check re-runs when they approve; mark the
+      check required in branch protection to make this binding.
     required: false
     default: "false"
+  line-comments:
+    description: >-
+      "true" (default) — post inline review comments on the exact lines the
+      policy rules hit (deduplicated across runs; hits outside the diff stay
+      in the gate report comment). Requires `pull-requests: write`.
+    required: false
+    default: "true"
+  request-changes:
+    description: >-
+      "true" (default) — while the policy verdict is fail, keep a Changes
+      Requested review on the PR naming the restricted domains, and dismiss
+      it automatically once the gate passes or the failure is waived.
+      Requires `pull-requests: write`.
+    required: false
+    default: "true"
   pr-comment:
     description: >-
       Post the gate report as a sticky PR comment (edited in place on each
@@ -83,8 +99,12 @@ outputs:
     description: "Number of warning-severity policy findings."
   waived:
     description: >-
-      "true" when a policy failure was waived by a required reviewer's
-      approval of the current head commit.
+      "true" when a policy failure was waived by a qualified approval of
+      the current head commit.
+  denied-domains:
+    description: >-
+      Comma-separated restricted domains hit at error severity (empty when
+      none) — the domains that caused a policy denial.
 
 runs:
   using: "node20"

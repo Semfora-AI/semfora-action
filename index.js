@@ -18,11 +18,18 @@
 //      (mirrors the cloud pipeline); anything else nonzero = analysis error.
 //   4. Project the report: step summary (markdown), inline annotations
 //      (::error/::warning file=), and action outputs.
-//   5. Required reviewers (optional): request the configured org members /
-//      contributors as reviewers on the PR, and — with require-approval —
-//      let one of them approving the current head commit waive a policy
-//      failure. Marking this check "required" in branch protection makes
-//      those people de-facto required reviewers for protected changes.
+//   5. PR surfaces (optional, all degrade to warnings — they can never flip
+//      the gate verdict):
+//      - sticky comment with linked findings, a complexity chart, and a
+//        cross-module dependency graph (Mermaid — GitHub renders it);
+//      - inline review comments on the exact lines the rules hit;
+//      - a Changes Requested review when policy denies the PR (restricted
+//        domains in semfora.toml), dismissed automatically once the gate
+//        passes or is waived;
+//      - required reviewers: request the configured org members /
+//        contributors, and let an approval of the current head commit waive
+//        a policy failure. require-approval: "admin" restricts the waiver
+//        to repo admins.
 // ---------------------------------------------------------------------------
 
 const { execFileSync, execFile } = require("node:child_process")
@@ -201,8 +208,6 @@ function readEvent() {
   }
 }
 
-// --- 5. required reviewers -------------------------------------------------------
-
 const GITHUB_API = (process.env.GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "")
 
 async function gh(token, method, pathname, body) {
@@ -223,39 +228,323 @@ async function gh(token, method, pathname, body) {
   )
 }
 
+async function ghPaged(token, pathname, { maxPages = 10 } = {}) {
+  const sep = pathname.includes("?") ? "&" : "?"
+  const items = []
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await gh(token, "GET", `${pathname}${sep}per_page=100&page=${page}`)
+    if (!res.ok) break
+    const batch = await res.json()
+    items.push(...batch)
+    if (batch.length < 100) break
+  }
+  return items
+}
+
+// --- report rendering (sticky comment, graphs, links) ---------------------------
+
+const COMMENT_MARKER = "<!-- semfora-gate-comment -->"
+const LINE_MARKER = "<!-- semfora-gate-line -->"
+const REVIEW_MARKER = "<!-- semfora-gate-review -->"
+
+function codeLink(repo, sha, file, line) {
+  const server = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/$/, "")
+  return `${server}/${repo}/blob/${sha}/${file}#L${line}`
+}
+
+/** Mermaid node ids must be plain; labels carry the real name. */
+function mermaidId(name) {
+  return `n_${String(name).replace(/[^A-Za-z0-9_]/g, "_")}`
+}
+function mermaidStr(s) {
+  return `"${String(s).replace(/"/g, "'")}"`
+}
+
+/** Restricted domains behind error-severity `protected` hits. */
+function deniedDomains(report) {
+  const domains = new Set()
+  for (const h of report.rule_hits ?? []) {
+    if (h.rule === "protected" && h.severity === "error") {
+      for (const g of h.groups ?? []) domains.add(g)
+    }
+  }
+  return [...domains].sort()
+}
+
+function formatEvidence(evidence) {
+  return Object.entries(evidence ?? {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join(", ")
+}
+
+function findingsTable(report, repo, headSha) {
+  const hits = (report.rule_hits ?? []).slice(0, 30)
+  if (hits.length === 0) return ""
+  const rows = hits.map((h) => {
+    const location =
+      h.file && headSha
+        ? `[\`${h.file}:${h.line}\`](${codeLink(repo, headSha, h.file, h.line)})`
+        : h.file
+          ? `\`${h.file}:${h.line}\``
+          : h.module || ""
+    const severity = h.severity === "error" ? "🛑" : "⚠️"
+    const evidence = formatEvidence(h.evidence)
+    const detail = `${h.message}${evidence ? ` (${evidence})` : ""}`
+    return `| ${severity} | ${h.rule} | ${location} | ${h.symbol ? `\`${h.symbol}\`` : "—"} | ${detail.replace(/\|/g, "\\|")} |`
+  })
+  const more =
+    (report.rule_hits_total ?? hits.length) > hits.length
+      ? `\n_…and ${report.rule_hits_total - hits.length} more — see the workflow step summary._`
+      : ""
+  return [
+    "#### Findings",
+    "",
+    "| | Rule | Location | Symbol | Detail |",
+    "|---|---|---|---|---|",
+    ...rows,
+    more,
+    "",
+  ].join("\n")
+}
+
+/** Before/after cognitive-complexity bar chart for complexity-rule hits. */
+function complexityChart(report) {
+  const hits = (report.rule_hits ?? [])
+    .filter((h) => h.rule === "complexity" && h.evidence?.cc !== undefined)
+    .slice(0, 12)
+  if (hits.length === 0) return ""
+  const names = hits.map((h) => mermaidStr(h.symbol || h.module || "?"))
+  const after = hits.map((h) => h.evidence.cc)
+  const before = hits.map((h) => h.evidence.cc_before ?? 0)
+  return [
+    "#### Complexity increase",
+    "",
+    "```mermaid",
+    "xychart-beta",
+    `  title ${mermaidStr("Cognitive complexity (tall bar = this PR, overlay = before)")}`,
+    `  x-axis [${names.join(", ")}]`,
+    `  y-axis ${mermaidStr("cognitive complexity")}`,
+    `  bar [${after.join(", ")}]`,
+    `  bar [${before.join(", ")}]`,
+    "```",
+    "",
+  ].join("\n")
+}
+
+/** Module dependency graph of coupling the PR adds. */
+function couplingGraph(report) {
+  const pairs = (report.coupling_delta?.pairs ?? [])
+    .filter((p) => (p.after ?? 0) > (p.before ?? 0))
+    .slice(0, 20)
+  if (pairs.length === 0) return ""
+  const lines = ["```mermaid", "graph LR"]
+  for (const p of pairs) {
+    const label =
+      (p.before ?? 0) === 0
+        ? `NEW · ${p.after} ref${p.after === 1 ? "" : "s"}`
+        : `+${p.after - p.before} refs`
+    lines.push(
+      `  ${mermaidId(p.from)}[${mermaidStr(p.from)}] -->|${mermaidStr(label)}| ${mermaidId(p.to)}[${mermaidStr(p.to)}]`,
+    )
+  }
+  lines.push("```")
+  return [
+    "#### New cross-module dependencies",
+    "",
+    ...lines,
+    "",
+  ].join("\n")
+}
+
+function commentBody(report, repo, headSha, waivedBy, approvalHint) {
+  const status =
+    report.verdict === "fail"
+      ? waivedBy
+        ? `⚠️ failed — waived by @${waivedBy}'s approval`
+        : "❌ failed"
+      : "✅ passed"
+  const parts = [
+    COMMENT_MARKER,
+    `### Semfora Gate ${status}`,
+    "",
+    `**${report.errors ?? 0}** policy error(s) · **${report.warnings ?? 0}** warning(s) · ${report.files_changed ?? 0} files, ${report.symbols_changed ?? 0} symbols changed · ${report.coupling_delta?.new_edges ?? 0} new cross-module edge(s)`,
+    "",
+  ]
+  const denied = deniedDomains(report)
+  if (report.verdict === "fail" && denied.length > 0 && !waivedBy) {
+    parts.push(
+      `> 🚫 **Denied by policy** — this PR edits restricted domain(s): **${denied.join(", ")}**. \`semfora.toml\` marks them protected at error severity, so the gate blocks this PR.${approvalHint}`,
+      "",
+    )
+  }
+  parts.push(
+    findingsTable(report, repo, headSha),
+    complexityChart(report),
+    couplingGraph(report),
+    `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analysis runs entirely in your CI; your code never leaves your runner.</sub>`,
+  )
+  // GitHub caps comment bodies at 65536 chars; leave room for the frame.
+  let body = parts.filter(Boolean).join("\n")
+  if (body.length > 60000) {
+    body = `${body.slice(0, 60000)}\n\n…truncated — see the full report in the workflow step summary.`
+  }
+  return body
+}
+
+// --- sticky comment --------------------------------------------------------------
+
+async function findGateComment(token, repo, prNumber) {
+  const comments = await ghPaged(token, `/repos/${repo}/issues/${prNumber}/comments`)
+  return comments.find((c) => c.body?.includes(COMMENT_MARKER)) ?? null
+}
+
+async function upsertPrComment(token, repo, prNumber, existing, body) {
+  const res = existing
+    ? await gh(token, "PATCH", `/repos/${repo}/issues/comments/${existing.id}`, { body })
+    : await gh(token, "POST", `/repos/${repo}/issues/${prNumber}/comments`, { body })
+  if (!res.ok) {
+    warn(
+      `Semfora could not post the PR comment (HTTP ${res.status}). The ` +
+        "github-token needs `pull-requests: write`.",
+    )
+  }
+}
+
+// --- inline line comments ----------------------------------------------------------
+
 /**
- * Parse the required-reviewers input. Plain entries are usernames; entries
- * containing "/" are org teams (the org part is informational — GitHub keys
- * team review requests on the slug within the repo's own org).
+ * file -> Set(new-side line numbers that are inside a diff hunk). GitHub
+ * rejects review comments outside hunks, so hits elsewhere stay in the
+ * sticky-comment table (still linked) instead of 422ing.
+ */
+async function commentableLines(token, repo, prNumber) {
+  const map = new Map()
+  const files = await ghPaged(token, `/repos/${repo}/pulls/${prNumber}/files`, { maxPages: 3 })
+  for (const f of files) {
+    if (!f.patch) continue
+    const lines = new Set()
+    let newLine = 0
+    for (const raw of f.patch.split("\n")) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw)
+      if (hunk) {
+        newLine = Number(hunk[1])
+        continue
+      }
+      if (raw.startsWith("+") || raw.startsWith(" ") || raw === "") {
+        lines.add(newLine)
+        newLine++
+      }
+      // "-" lines belong to the old side; "\ No newline" markers count for neither.
+    }
+    map.set(f.filename, lines)
+  }
+  return map
+}
+
+async function postLineComments(token, repo, pr, report) {
+  const hits = (report.rule_hits ?? []).filter((h) => h.file && h.line).slice(0, 25)
+  if (hits.length === 0) return
+  const commentable = await commentableLines(token, repo, pr.number)
+  const existing = new Set(
+    (await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/comments`, { maxPages: 5 }))
+      .filter((c) => c.body?.includes(LINE_MARKER))
+      .map((c) => `${c.path}:${c.line ?? c.original_line}`),
+  )
+  let failures = 0
+  for (const h of hits) {
+    if (!commentable.get(h.file)?.has(h.line)) continue
+    if (existing.has(`${h.file}:${h.line}`)) continue
+    const evidence = formatEvidence(h.evidence)
+    const body = [
+      LINE_MARKER,
+      `**Semfora: ${h.rule}** (${h.severity})${h.groups?.length ? ` — domains: ${h.groups.join(", ")}` : ""}`,
+      "",
+      h.message,
+      evidence ? `\n\`${evidence}\`` : "",
+    ]
+      .filter(Boolean)
+      .join("\n")
+    const res = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/comments`, {
+      commit_id: pr.head?.sha,
+      path: h.file,
+      line: h.line,
+      side: "RIGHT",
+      body,
+    })
+    if (!res.ok) failures++
+  }
+  if (failures > 0) {
+    warn(
+      `Semfora could not place ${failures} inline comment(s) — they remain ` +
+        "in the gate report comment. The github-token needs `pull-requests: write`.",
+    )
+  }
+}
+
+// --- deny review (Changes Requested) ------------------------------------------------
+
+async function syncDenyReview(token, repo, pr, denied, domains) {
+  const reviews = await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/reviews`)
+  const active = reviews.filter(
+    (r) => r.state === "CHANGES_REQUESTED" && r.body?.includes(REVIEW_MARKER),
+  )
+  if (denied) {
+    if (active.length > 0) return // one standing deny review is enough
+    const res = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/reviews`, {
+      event: "REQUEST_CHANGES",
+      body: [
+        REVIEW_MARKER,
+        "🚫 **Semfora Gate denied this pull request.**",
+        "",
+        domains.length > 0
+          ? `It edits restricted domain(s) protected by \`semfora.toml\`: **${domains.join(", ")}**.`
+          : "It violates error-severity rules in `semfora.toml`.",
+        "",
+        "Details are in the gate report comment and inline annotations. This review is dismissed automatically when the gate passes or the failure is waived.",
+      ].join("\n"),
+    })
+    if (!res.ok) {
+      warn(`Semfora could not submit the deny review (HTTP ${res.status}).`)
+    }
+  } else {
+    for (const r of active) {
+      const res = await gh(token, "PUT", `/repos/${repo}/pulls/${pr.number}/reviews/${r.id}/dismissals`, {
+        message: "Semfora gate passed (or the failure was waived) — dismissing the deny review.",
+      })
+      if (!res.ok) {
+        warn(`Semfora could not dismiss its deny review (HTTP ${res.status}).`)
+      }
+    }
+  }
+}
+
+// --- required reviewers / approvals ---------------------------------------------------
+
+/**
+ * Parse the reviewer inputs. Plain entries are usernames; entries containing
+ * "/" are org teams (the org part is informational — GitHub keys team review
+ * requests on the slug within the repo's own org). Returns null when neither
+ * required-reviewers nor require-approval is configured.
  */
 function reviewerConfig() {
   const entries = input("required-reviewers")
     .split(/[\s,]+/)
     .map((e) => e.replace(/^@/, ""))
     .filter(Boolean)
-  if (entries.length === 0) return null
+  const approvalRaw = input("require-approval").toLowerCase()
+  const approvalMode =
+    approvalRaw === "admin"
+      ? "admin"
+      : approvalRaw === "true" || approvalRaw === "reviewers"
+        ? "reviewers"
+        : "off"
+  if (entries.length === 0 && approvalMode === "off") return null
   return {
     users: entries.filter((e) => !e.includes("/")),
     teams: entries.filter((e) => e.includes("/")).map((e) => e.split("/").pop()),
     requestOn: (input("request-reviewers-on") || "fail").toLowerCase(),
-    requireApproval: input("require-approval").toLowerCase() === "true",
+    approvalMode,
   }
-}
-
-async function listReviews(token, repo, prNumber) {
-  const reviews = []
-  for (let page = 1; page <= 10; page++) {
-    const res = await gh(
-      token,
-      "GET",
-      `/repos/${repo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`,
-    )
-    if (!res.ok) break
-    const batch = await res.json()
-    reviews.push(...batch)
-    if (batch.length < 100) break
-  }
-  return reviews
 }
 
 /** true / false / null (=inconclusive: token can't see the collaborator list). */
@@ -264,6 +553,17 @@ async function isCollaborator(token, repo, username) {
   if (res.status === 204) return true
   if (res.status === 404) return false
   return null
+}
+
+async function isRepoAdmin(token, repo, username) {
+  const res = await gh(
+    token,
+    "GET",
+    `/repos/${repo}/collaborators/${encodeURIComponent(username)}/permission`,
+  )
+  if (!res.ok) return false
+  const data = await res.json()
+  return data.permission === "admin" || data.role_name === "admin"
 }
 
 /**
@@ -276,7 +576,7 @@ async function requestReviewers(token, repo, pr, cfg) {
   const author = pr.user?.login
   const alreadyRequested = new Set((pr.requested_reviewers ?? []).map((u) => u.login))
   const requestedTeams = new Set((pr.requested_teams ?? []).map((t) => t.slug))
-  const reviews = await listReviews(token, repo, pr.number)
+  const reviews = await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/reviews`)
   const alreadyReviewed = new Set(reviews.map((r) => r.user?.login).filter(Boolean))
   const owner = repo.split("/")[0]
 
@@ -317,69 +617,15 @@ async function requestReviewers(token, repo, pr, cfg) {
   }
 }
 
-// Sticky PR comment: one comment per PR, found by marker and edited in
-// place on every run so the thread never fills with stale gate reports.
-const COMMENT_MARKER = "<!-- semfora-gate-comment -->"
-
-async function findGateComment(token, repo, prNumber) {
-  for (let page = 1; page <= 10; page++) {
-    const res = await gh(
-      token,
-      "GET",
-      `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
-    )
-    if (!res.ok) return null
-    const batch = await res.json()
-    const hit = batch.find((c) => c.body?.includes(COMMENT_MARKER))
-    if (hit) return hit
-    if (batch.length < 100) return null
-  }
-  return null
-}
-
-async function upsertPrComment(token, repo, prNumber, existing, body) {
-  const res = existing
-    ? await gh(token, "PATCH", `/repos/${repo}/issues/comments/${existing.id}`, { body })
-    : await gh(token, "POST", `/repos/${repo}/issues/${prNumber}/comments`, { body })
-  if (!res.ok) {
-    warn(
-      `Semfora could not post the PR comment (HTTP ${res.status}). The ` +
-        "github-token needs `pull-requests: write`.",
-    )
-  }
-}
-
-function commentBody(report, summaryMd, waivedBy) {
-  const status =
-    report.verdict === "fail"
-      ? waivedBy
-        ? `⚠️ failed — waived by @${waivedBy}'s approval`
-        : "❌ failed"
-      : "✅ passed"
-  // GitHub caps comment bodies at 65536 chars; leave room for the frame.
-  let details = summaryMd || ""
-  if (details.length > 60000) {
-    details = `${details.slice(0, 60000)}\n\n…truncated — see the full report in the workflow step summary.`
-  }
-  return [
-    COMMENT_MARKER,
-    `### Semfora Gate ${status}`,
-    "",
-    `**${report.errors ?? 0}** policy error(s) · **${report.warnings ?? 0}** warning(s) · ${report.files_changed ?? 0} files changed`,
-    "",
-    details,
-    "",
-    `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analysis runs entirely in your CI; your code never leaves your runner.</sub>`,
-  ].join("\n")
-}
-
 /**
- * Return the login of a required reviewer whose LATEST review is an approval
- * of the PR's current head commit, or null. Stale approvals (older commit)
- * don't count — an approval must cover the code actually being merged.
+ * Return the login of a qualified approver whose LATEST review is an
+ * approval of the PR's current head commit, or null. Stale approvals (older
+ * commit) don't count — an approval must cover the code actually merging.
+ * Mode "reviewers": approver must be in required-reviewers (or a member of
+ * a listed team). Mode "admin": approver must have admin permission.
  */
 async function findQualifiedApproval(token, repo, pr, cfg) {
-  const reviews = await listReviews(token, repo, pr.number)
+  const reviews = await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/reviews`)
   const headSha = pr.head?.sha
   const latest = new Map()
   for (const review of reviews) {
@@ -393,6 +639,11 @@ async function findQualifiedApproval(token, repo, pr, cfg) {
   for (const [login, review] of latest) {
     if (review.state !== "APPROVED") continue
     if (headSha && review.commit_id !== headSha) continue
+    if (login === pr.user?.login) continue // self-approval never waives
+    if (cfg.approvalMode === "admin") {
+      if (await isRepoAdmin(token, repo, login)) return login
+      continue
+    }
     if (cfg.users.includes(login)) return login
     for (const team of cfg.teams) {
       const res = await gh(
@@ -490,25 +741,28 @@ async function main() {
     })
   }
 
-  // Reviewers: request + (optionally) waive on approval. Failures here are
-  // warnings, never gate verdicts — the reviewer plumbing must not be able
-  // to flip a pass to a fail.
+  // PR surfaces. Shared degradation rule: anything that goes wrong here is
+  // a warning, never a gate verdict — plumbing must not flip pass to fail.
   const reviewers = reviewerConfig()
   const token = input("github-token") || process.env.GITHUB_TOKEN || ""
   const repoSlug = process.env.GITHUB_REPOSITORY || ""
+  const canUsePr = Boolean(pr?.number && repoSlug && token)
   let waivedBy = null
+
   if (reviewers) {
-    if (!pr || !pr.number || !repoSlug) {
-      warn("Semfora: required-reviewers is set but this is not a pull request run — skipped.")
-    } else if (!token) {
-      warn("Semfora: required-reviewers is set but no github-token is available — skipped.")
+    if (!canUsePr) {
+      warn(
+        "Semfora: reviewer/approval inputs are set but this is not a pull " +
+          "request run (or no github-token is available) — skipped.",
+      )
     } else {
       try {
         const shouldRequest =
-          reviewers.requestOn === "always" ||
-          (reviewers.requestOn === "fail" && report.verdict === "fail")
+          (reviewers.users.length > 0 || reviewers.teams.length > 0) &&
+          (reviewers.requestOn === "always" ||
+            (reviewers.requestOn === "fail" && report.verdict === "fail"))
         if (shouldRequest) await requestReviewers(token, repoSlug, pr, reviewers)
-        if (reviewers.requireApproval && report.verdict === "fail") {
+        if (reviewers.approvalMode !== "off" && report.verdict === "fail") {
           waivedBy = await findQualifiedApproval(token, repoSlug, pr, reviewers)
         }
       } catch (e) {
@@ -517,26 +771,56 @@ async function main() {
     }
   }
 
-  // Sticky PR comment. Same degradation rule as the reviewer plumbing:
-  // comment problems are warnings, never gate verdicts.
-  const commentMode = (input("pr-comment") || "on-findings").toLowerCase()
-  if (commentMode !== "never" && pr?.number && repoSlug && token) {
-    try {
-      const hasFindings = (report.errors ?? 0) + (report.warnings ?? 0) > 0
-      const existing = await findGateComment(token, repoSlug, pr.number)
-      // on-findings: create only when there is something to say, but always
-      // refresh an existing comment so a stale failure never lingers.
-      if (commentMode === "always" || hasFindings || existing) {
-        await upsertPrComment(
-          token,
-          repoSlug,
-          pr.number,
-          existing,
-          commentBody(report, summaryMd, waivedBy),
-        )
+  if (canUsePr) {
+    // Inline comments on the exact lines the rules hit.
+    if ((input("line-comments") || "true").toLowerCase() !== "false") {
+      try {
+        await postLineComments(token, repoSlug, pr, report)
+      } catch (e) {
+        warn(`Semfora inline comments failed: ${e.message}`)
       }
-    } catch (e) {
-      warn(`Semfora PR comment failed: ${e.message}`)
+    }
+
+    // Deny review: Changes Requested while the policy verdict stands,
+    // dismissed once the gate passes or the failure is waived.
+    if ((input("request-changes") || "true").toLowerCase() !== "false") {
+      try {
+        const denied = report.verdict === "fail" && !waivedBy
+        await syncDenyReview(token, repoSlug, pr, denied, deniedDomains(report))
+      } catch (e) {
+        warn(`Semfora deny review failed: ${e.message}`)
+      }
+    }
+
+    // Sticky comment: linked findings, complexity chart, dependency graph.
+    const commentMode = (input("pr-comment") || "on-findings").toLowerCase()
+    if (commentMode !== "never") {
+      try {
+        const hasFindings = (report.errors ?? 0) + (report.warnings ?? 0) > 0
+        const existing = await findGateComment(token, repoSlug, pr.number)
+        // on-findings: create only when there is something to say, but always
+        // refresh an existing comment so a stale failure never lingers.
+        if (commentMode === "always" || hasFindings || existing) {
+          const approvalHint =
+            reviewers?.approvalMode === "admin"
+              ? " An approval of the current head commit from a repo admin waives this."
+              : reviewers?.approvalMode === "reviewers"
+                ? ` An approval of the current head commit from a required reviewer (${[
+                    ...reviewers.users,
+                    ...reviewers.teams.map((t) => `team ${t}`),
+                  ].join(", ")}) waives this.`
+                : ""
+          await upsertPrComment(
+            token,
+            repoSlug,
+            pr.number,
+            existing,
+            commentBody(report, repoSlug, pr.head?.sha, waivedBy, approvalHint),
+          )
+        }
+      } catch (e) {
+        warn(`Semfora PR comment failed: ${e.message}`)
+      }
     }
   }
 
@@ -544,6 +828,7 @@ async function main() {
   setOutput("errors", report.errors ?? 0)
   setOutput("warnings", report.warnings ?? 0)
   setOutput("waived", waivedBy ? "true" : "false")
+  setOutput("denied-domains", deniedDomains(report).join(","))
 
   if (report.verdict === "fail") {
     if (waivedBy) {
@@ -555,12 +840,14 @@ async function main() {
       )
     } else {
       const unblock =
-        reviewers?.requireApproval && pr
-          ? ` An approval of the current head commit from one of the required reviewers (${[
-              ...reviewers.users,
-              ...reviewers.teams.map((t) => `team ${t}`),
-            ].join(", ")}) waives this failure — the check re-runs on review via the pull_request_review trigger.`
-          : ""
+        reviewers?.approvalMode === "admin"
+          ? " An approval of the current head commit from a repo admin waives this failure — the check re-runs on review via the pull_request_review trigger."
+          : reviewers?.approvalMode === "reviewers"
+            ? ` An approval of the current head commit from one of the required reviewers (${[
+                ...reviewers.users,
+                ...reviewers.teams.map((t) => `team ${t}`),
+              ].join(", ")}) waives this failure — the check re-runs on review via the pull_request_review trigger.`
+            : ""
       fail(
         `Semfora gate failed: ${report.errors} policy error(s), ` +
           `${report.warnings} warning(s). See the step summary for details.${unblock}`,
