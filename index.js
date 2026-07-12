@@ -317,6 +317,62 @@ async function requestReviewers(token, repo, pr, cfg) {
   }
 }
 
+// Sticky PR comment: one comment per PR, found by marker and edited in
+// place on every run so the thread never fills with stale gate reports.
+const COMMENT_MARKER = "<!-- semfora-gate-comment -->"
+
+async function findGateComment(token, repo, prNumber) {
+  for (let page = 1; page <= 10; page++) {
+    const res = await gh(
+      token,
+      "GET",
+      `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+    )
+    if (!res.ok) return null
+    const batch = await res.json()
+    const hit = batch.find((c) => c.body?.includes(COMMENT_MARKER))
+    if (hit) return hit
+    if (batch.length < 100) return null
+  }
+  return null
+}
+
+async function upsertPrComment(token, repo, prNumber, existing, body) {
+  const res = existing
+    ? await gh(token, "PATCH", `/repos/${repo}/issues/comments/${existing.id}`, { body })
+    : await gh(token, "POST", `/repos/${repo}/issues/${prNumber}/comments`, { body })
+  if (!res.ok) {
+    warn(
+      `Semfora could not post the PR comment (HTTP ${res.status}). The ` +
+        "github-token needs `pull-requests: write`.",
+    )
+  }
+}
+
+function commentBody(report, summaryMd, waivedBy) {
+  const status =
+    report.verdict === "fail"
+      ? waivedBy
+        ? `⚠️ failed — waived by @${waivedBy}'s approval`
+        : "❌ failed"
+      : "✅ passed"
+  // GitHub caps comment bodies at 65536 chars; leave room for the frame.
+  let details = summaryMd || ""
+  if (details.length > 60000) {
+    details = `${details.slice(0, 60000)}\n\n…truncated — see the full report in the workflow step summary.`
+  }
+  return [
+    COMMENT_MARKER,
+    `### Semfora Gate ${status}`,
+    "",
+    `**${report.errors ?? 0}** policy error(s) · **${report.warnings ?? 0}** warning(s) · ${report.files_changed ?? 0} files changed`,
+    "",
+    details,
+    "",
+    `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analysis runs entirely in your CI; your code never leaves your runner.</sub>`,
+  ].join("\n")
+}
+
 /**
  * Return the login of a required reviewer whose LATEST review is an approval
  * of the PR's current head commit, or null. Stale approvals (older commit)
@@ -419,9 +475,10 @@ async function main() {
     fail("Semfora produced an unreadable report.")
   }
 
-  if (fs.existsSync(summaryPath)) {
-    appendSummary(fs.readFileSync(summaryPath, "utf8"))
-  }
+  const summaryMd = fs.existsSync(summaryPath)
+    ? fs.readFileSync(summaryPath, "utf8")
+    : ""
+  if (summaryMd) appendSummary(summaryMd)
   for (const hit of report.rule_hits ?? []) {
     annotate(hit.severity === "error" ? "error" : "warning", {
       file: hit.file || undefined,
@@ -457,6 +514,29 @@ async function main() {
       } catch (e) {
         warn(`Semfora reviewer step failed: ${e.message}`)
       }
+    }
+  }
+
+  // Sticky PR comment. Same degradation rule as the reviewer plumbing:
+  // comment problems are warnings, never gate verdicts.
+  const commentMode = (input("pr-comment") || "on-findings").toLowerCase()
+  if (commentMode !== "never" && pr?.number && repoSlug && token) {
+    try {
+      const hasFindings = (report.errors ?? 0) + (report.warnings ?? 0) > 0
+      const existing = await findGateComment(token, repoSlug, pr.number)
+      // on-findings: create only when there is something to say, but always
+      // refresh an existing comment so a stale failure never lingers.
+      if (commentMode === "always" || hasFindings || existing) {
+        await upsertPrComment(
+          token,
+          repoSlug,
+          pr.number,
+          existing,
+          commentBody(report, summaryMd, waivedBy),
+        )
+      }
+    } catch (e) {
+      warn(`Semfora PR comment failed: ${e.message}`)
     }
   }
 

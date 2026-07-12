@@ -33,6 +33,17 @@ jobs:
           semfora-key: ${{ secrets.SEMFORA_KEY }}
 ```
 
+## PR comments
+
+By default the action maintains **one sticky comment per PR** with the gate
+report (verdict, error/warning counts, the same markdown as the step
+summary). It is edited in place on every run — pushes never pile up new
+comments, and a comment left by an earlier failing run is refreshed to green
+once the PR is fixed. Grant `pull-requests: write` and tune with
+`pr-comment: on-findings | always | never`. Comments post as
+`github-actions[bot]`; Semfora-branded comments come from the semfora.ai
+cloud gate, not this action.
+
 ## Required reviewers
 
 The gate can route failing PRs to the humans who own the risk. List org
@@ -114,6 +125,7 @@ threshold = 40
 | `target-ref` | no | `HEAD` | `WORKING` gates uncommitted changes. |
 | `engine-path` | no | — | Pre-provisioned binary for air-gapped/self-hosted runners (key still verified). |
 | `api-url` | no | `https://semfora.ai` | Self-hosted deployments only (must be https). |
+| `pr-comment` | no | `on-findings` | Sticky PR comment with the report: `on-findings`, `always`, or `never`. Needs `pull-requests: write`. |
 | `required-reviewers` | no | — | Usernames / `org/team` slugs to request as reviewers. Needs `pull-requests: write`. |
 | `request-reviewers-on` | no | `fail` | `fail`, `always`, or `never`. |
 | `require-approval` | no | `false` | `"true"` → a policy failure passes only after a required reviewer approves the head commit. |

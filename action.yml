@@ -58,6 +58,14 @@ inputs:
       branch protection to make these reviewers de-facto required.
     required: false
     default: "false"
+  pr-comment:
+    description: >-
+      Post the gate report as a sticky PR comment (edited in place on each
+      run): "on-findings" (default — comment when there are errors or
+      warnings, and keep refreshing an existing comment), "always", or
+      "never". Requires `pull-requests: write`.
+    required: false
+    default: "on-findings"
   github-token:
     description: >-
       Token for the reviewer API calls. Defaults to the workflow token;
