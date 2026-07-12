@@ -749,8 +749,21 @@ async function main() {
 
   // PR surfaces. Shared degradation rule: anything that goes wrong here is
   // a warning, never a gate verdict — plumbing must not flip pass to fail.
+  //
+  // Identity: when the gate response vends a posting token (a Semfora
+  // GitHub App installation token minted server-side, scoped to this one
+  // repo with pull_requests:write), comments/reviews post as semfora[bot].
+  // Otherwise we fall back to the workflow token, which GitHub always
+  // renders as github-actions[bot] — that identity cannot be renamed.
   const reviewers = reviewerConfig()
-  const token = input("github-token") || process.env.GITHUB_TOKEN || ""
+  const semforaToken =
+    typeof settled.githubToken === "string" ? settled.githubToken : ""
+  if (semforaToken) mask(semforaToken)
+  const token =
+    semforaToken || input("github-token") || process.env.GITHUB_TOKEN || ""
+  if (semforaToken) {
+    console.log("PR comments and reviews will post as semfora[bot].")
+  }
   const canUsePr = Boolean(pr?.number && repoSlug && token)
   let waivedBy = null
 

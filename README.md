@@ -62,8 +62,13 @@ PR itself:
   Combined with a required status check this is a hard deny: the config in
   the repo decides, the action enforces.
 
-Comments post as `github-actions[bot]`; Semfora-branded comments come from
-the semfora.ai cloud gate, not this action.
+**Bot identity:** when the gate response includes a Semfora posting token
+(the default for repos connected via the Semfora GitHub App), everything
+above posts as **`semfora[bot]`** with the Semfora avatar — the same
+identity as the semfora.ai check runs. Without it, the action falls back to
+the workflow token, which GitHub always renders as `github-actions[bot]`
+(that name cannot be changed). The vended token also makes PR surfaces work
+on fork PRs, where the workflow token is read-only.
 
 ## Required reviewers
 
