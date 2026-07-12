@@ -2,8 +2,9 @@ name: "Semfora Gate"
 description: >-
   Semantic PR gate: checks a pull request against your team's policy in
   semfora.toml (protected domains, load-bearing edits, new cross-module
-  dependencies, complexity budgets). Runs entirely inside your runner —
-  your code never leaves your infrastructure.
+  dependencies, complexity budgets). Analysis runs in Semfora's isolated
+  cloud pipeline via your GitHub App connection — nothing runs on your
+  runner, and the report contains symbol names and numbers only.
 author: "Semfora"
 branding:
   icon: "shield"
@@ -18,19 +19,15 @@ inputs:
     required: true
   base:
     description: >-
-      Base ref/sha to gate against. Defaults to the pull request base sha
-      from the workflow event.
+      Base sha to gate against. Defaults to the pull request base sha from
+      the workflow event.
     required: false
-  target-ref:
-    description: 'Target ref (default HEAD; "WORKING" for uncommitted changes).'
-    required: false
-    default: "HEAD"
-  engine-path:
+  poll-timeout-minutes:
     description: >-
-      Path to a pre-provisioned semfora-engine binary (air-gapped runners /
-      self-hosted mirrors). When set, no download happens; the license key
-      is still verified.
+      How long to wait for the cloud gate run to finish before failing the
+      step. First-time indexes of very large repos may need more.
     required: false
+    default: "20"
   api-url:
     description: "Semfora API base (self-hosted deployments only)."
     required: false

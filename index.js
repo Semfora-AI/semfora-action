@@ -1,24 +1,25 @@
 // ---------------------------------------------------------------------------
-// Semfora Gate — GitHub Action entry point (SEM-226).
+// Semfora Gate — GitHub Action entry point (SEM-226, cloud-gate rework).
 //
 // Deliberately dependency-free (no @actions/* toolkit): everything below is
 // plain Node 20 against the documented Actions contracts (INPUT_* env,
 // workflow commands on stdout, GITHUB_OUTPUT / GITHUB_STEP_SUMMARY files).
 // A security-tool action should be auditable in one file.
 //
-// Flow:
-//   1. Verify the license key against semfora.ai — no key, no gate. This is
-//      the "approved customers only" control; the response also tells us
-//      which engine build to fetch.
-//   2. Resolve the engine binary: customer-provided path (air-gapped) or
-//      verified download cached in the tool cache. Downloads are refused
-//      without a checksum.
-//   3. Run `semfora-engine ci` on the PR diff. The engine runs entirely on
-//      this runner — source code never leaves it. Exit 20 = policy fail
-//      (mirrors the cloud pipeline); anything else nonzero = analysis error.
-//   4. Project the report: step summary (markdown), inline annotations
+// The action is a THIN CLIENT — no engine binary ever reaches this runner,
+// and the runner analyzes nothing (a checkout step isn't even required):
+//   1. POST /api/gate/enqueue on semfora.ai with the license key + PR
+//      coordinates. Semfora verifies the key AND that the key's billing
+//      account owns this repo, then queues the gate run in its isolated
+//      analysis pipeline (the same one that powers the dashboard). The
+//      pipeline clones via the repo's Semfora GitHub App installation —
+//      the repo must be connected on semfora.ai.
+//   2. Poll /api/gate/status until the run finishes. The response is the
+//      distilled gate report: verdict, rule hits, coupling — symbol NAMES
+//      and NUMBERS only, never source.
+//   3. Project the report: step summary (markdown), inline annotations
 //      (::error/::warning file=), and action outputs.
-//   5. PR surfaces (optional, all degrade to warnings — they can never flip
+//   4. PR surfaces (optional, all degrade to warnings — they can never flip
 //      the gate verdict):
 //      - sticky comment with linked findings, a complexity chart, and a
 //        cross-module dependency graph (Mermaid — GitHub renders it);
@@ -32,10 +33,7 @@
 //        to repo admins.
 // ---------------------------------------------------------------------------
 
-const { execFileSync, execFile } = require("node:child_process")
-const { createHash } = require("node:crypto")
 const fs = require("node:fs")
-const path = require("node:path")
 
 // --- tiny Actions runtime helpers --------------------------------------------
 
@@ -123,77 +121,90 @@ function requireHttps(rawUrl, what) {
   }
 }
 
-// --- 1. license verification --------------------------------------------------
+// --- 1. cloud gate: enqueue + poll ---------------------------------------------
 
-async function verifyKey(apiUrl, key) {
+async function gateApi(apiUrl, pathname, body) {
   let res
   try {
-    res = await fetchWithRetry(`${apiUrl.replace(/\/$/, "")}/api/action/verify`, {
+    res = await fetchWithRetry(`${apiUrl.replace(/\/$/, "")}${pathname}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ key, platform: "linux-x64" }),
+      body: JSON.stringify(body),
     })
   } catch (e) {
-    fail(
-      `Could not reach Semfora to verify the license key (${e.message}). ` +
-        "Air-gapped runners must set engine-path AND have network access to " +
-        "the api-url; fully offline licensing is coming.",
-    )
+    fail(`Could not reach Semfora (${pathname}): ${e.message}.`)
   }
   if (res.status === 403) {
     fail(
-      "Semfora license key was rejected. Gate runs are available to " +
-        "licensed customers — get or renew a key at https://semfora.ai.",
+      "Semfora rejected the request: the license key is invalid, or it " +
+        "does not belong to the account that owns this repository on " +
+        "semfora.ai. Gate runs are available to licensed customers for " +
+        "their own connected repos — https://semfora.ai.",
     )
   }
-  if (!res.ok) fail(`Semfora verification failed (${res.status}).`)
+  if (!res.ok) {
+    let detail = ""
+    try {
+      detail = (await res.json()).error ?? ""
+    } catch {
+      /* body optional */
+    }
+    fail(`Semfora gate API failed (${res.status}${detail ? `: ${detail}` : ""}).`)
+  }
   return res.json()
 }
 
-// --- 2. engine resolution ------------------------------------------------------
-
-async function resolveEngine(verified) {
-  const provided = input("engine-path")
-  if (provided) {
-    if (!fs.existsSync(provided)) fail(`engine-path does not exist: ${provided}`)
-    return provided
-  }
-  if (!verified.downloadUrl) {
-    fail(
-      "No engine download is available for this platform yet. Provision " +
-        "the binary yourself and pass it via the engine-path input.",
-    )
-  }
-  requireHttps(verified.downloadUrl, "The engine download URL")
-  if (!verified.sha256) {
-    fail(
-      "Semfora did not provide a checksum for the engine download — " +
-        "refusing to run an unverified binary. Pass a pre-provisioned " +
-        "binary via engine-path, or contact support@semfora.ai.",
-    )
-  }
-  const cacheRoot = process.env.RUNNER_TOOL_CACHE || fs.mkdtempSync("/tmp/semfora-")
-  const dir = path.join(cacheRoot, "semfora-engine", verified.engineVersion)
-  const bin = path.join(dir, "semfora-engine")
-  if (!fs.existsSync(bin)) {
-    fs.mkdirSync(dir, { recursive: true })
-    const res = await fetchWithRetry(verified.downloadUrl, {}, {
-      attempts: 2,
-      timeoutMs: 5 * 60 * 1000,
-    })
-    if (!res.ok) fail(`Engine download failed (${res.status}).`)
-    const bytes = Buffer.from(await res.arrayBuffer())
-    const digest = createHash("sha256").update(bytes).digest("hex")
-    if (digest !== verified.sha256) {
-      fail("Engine binary checksum mismatch — refusing to run it.")
+/** Poll until the run settles. Backoff: 5s for the first minute, then 15s. */
+async function waitForVerdict(apiUrl, key, runId, timeoutMs) {
+  const started = Date.now()
+  let polls = 0
+  for (;;) {
+    const elapsed = Date.now() - started
+    if (elapsed > timeoutMs) {
+      fail(
+        `Semfora gate run did not finish within ${Math.round(timeoutMs / 60000)} ` +
+          "minutes. Large first-time indexes can take longer — raise " +
+          "poll-timeout-minutes, or check the run on the semfora.ai dashboard.",
+      )
     }
-    // Atomic publish: concurrent jobs on a self-hosted runner share the tool
-    // cache, and a half-written binary must never be executable.
-    const tmp = `${bin}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, bytes, { mode: 0o755 })
-    fs.renameSync(tmp, bin)
+    const status = await gateApi(apiUrl, "/api/gate/status", { key, runId })
+    if (status.status === "SUCCEEDED") return status
+    if (status.status === "FAILED" || status.status === "CANCELED") {
+      fail(
+        `Semfora analysis ${status.status.toLowerCase()}${
+          status.errorMessage ? `: ${status.errorMessage}` : ""
+        }`,
+      )
+    }
+    polls++
+    if (polls === 1) notice("Semfora gate queued — analyzing in Semfora's pipeline…")
+    await new Promise((r) => setTimeout(r, elapsed < 60_000 ? 5_000 : 15_000))
   }
-  return bin
+}
+
+/**
+ * Adapt the API's distilled gate report (camelCase CiMetrics) to the shape
+ * the renderer below consumes (the engine's snake_case ci_report — kept so
+ * the entire PR-surface renderer is unchanged from the local-run era).
+ */
+function toReport(ci) {
+  return {
+    verdict: ci.verdict === "fail" ? "fail" : "pass",
+    gate_active: ci.gateActive === true,
+    errors: ci.errors ?? 0,
+    warnings: ci.warnings ?? 0,
+    rule_hits: Array.isArray(ci.ruleHits) ? ci.ruleHits : [],
+    rule_hits_total: ci.ruleHitsTotal ?? (ci.ruleHits?.length || 0),
+    files_changed: ci.filesChanged ?? 0,
+    symbols_changed: ci.symbolsChanged ?? 0,
+    coupling_delta: ci.couplingDelta
+      ? {
+          new_edges: ci.couplingDelta.newEdges ?? 0,
+          pairs: ci.couplingDelta.pairs ?? [],
+        }
+      : undefined,
+    summary_md: ci.summaryMd ?? "",
+  }
 }
 
 // --- GitHub context ------------------------------------------------------------
@@ -381,7 +392,7 @@ function commentBody(report, repo, headSha, waivedBy, approvalHint) {
     findingsTable(report, repo, headSha),
     complexityChart(report),
     couplingGraph(report),
-    `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analysis runs entirely in your CI; your code never leaves your runner.</sub>`,
+    `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analyzed in Semfora's isolated pipeline via your GitHub App connection; this report contains symbol names and numbers only, never source.</sub>`,
   )
   // GitHub caps comment bodies at 65536 chars; leave room for the frame.
   let body = parts.filter(Boolean).join("\n")
@@ -666,70 +677,65 @@ async function main() {
   const apiUrl = input("api-url") || "https://semfora.ai"
   requireHttps(apiUrl, "api-url")
 
+  // Removed inputs from the local-run era: fail loudly rather than let a
+  // workflow believe an unsupported knob still does something.
+  if (input("engine-path")) {
+    fail(
+      "engine-path is no longer supported: gate analysis runs in Semfora's " +
+        "cloud pipeline, not on this runner. Remove the input (and any " +
+        "checkout/fetch-depth plumbing that only existed for it).",
+    )
+  }
+  if (input("target-ref") && input("target-ref") !== "HEAD") {
+    fail(
+      "target-ref is no longer supported: the cloud gate analyzes the " +
+        "pushed PR head, so uncommitted-changes gating (WORKING) is not " +
+        "available. Remove the input.",
+    )
+  }
+
   const event = readEvent()
   const pr = event.pull_request
+  const repoSlug = process.env.GITHUB_REPOSITORY || ""
+  if (!repoSlug) fail("GITHUB_REPOSITORY is not set — not a GitHub Actions run?")
   const base = input("base") || pr?.base?.sha || ""
   if (!base) {
     fail(
       "No base to gate against: set the `base` input, or run on a " +
-        "pull_request event. Note: use actions/checkout with fetch-depth: 0 " +
-        "so the base commit is present.",
+        "pull_request event.",
     )
   }
-  const targetRef = input("target-ref") || "HEAD"
-  const workspace = process.env.GITHUB_WORKSPACE || process.cwd()
+  const headSha = pr?.head?.sha || process.env.GITHUB_SHA || ""
 
-  const verified = await verifyKey(apiUrl, key)
-  const engine = await resolveEngine(verified)
-  console.log(`Semfora engine ${verified.engineVersion} (plan: ${verified.plan})`)
-
-  // The index is a prerequisite; its cost is the bulk of the run.
-  execFileSync(engine, ["index", "generate", "."], {
-    cwd: workspace,
-    stdio: ["ignore", "ignore", "inherit"],
-    timeout: 20 * 60 * 1000,
+  const timeoutMinutes = Number(input("poll-timeout-minutes")) || 20
+  const enqueued = await gateApi(apiUrl, "/api/gate/enqueue", {
+    key,
+    repo: repoSlug,
+    baseSha: base,
+    headSha: headSha || undefined,
+    prNumber: pr?.number,
+    headRef: pr?.head?.ref,
+    baseRef: pr?.base?.ref,
   })
-
-  const summaryPath = path.join(
-    process.env.RUNNER_TEMP || "/tmp",
-    "semfora-gate-summary.md",
+  console.log(
+    `Semfora gate run ${enqueued.runId}${enqueued.reused ? " (reusing an in-flight run for this head)" : ""}`,
   )
-  const args = [
-    "ci",
-    "--base",
-    base,
-    "--target-ref",
-    targetRef,
-    "--summary-md",
-    summaryPath,
-    "--format",
-    "json",
-  ]
-  const result = await new Promise((resolvePromise) => {
-    execFile(
-      engine,
-      args,
-      { cwd: workspace, maxBuffer: 64 * 1024 * 1024, timeout: 25 * 60 * 1000 },
-      (error, stdout) => resolvePromise({ code: error?.code ?? 0, stdout }),
+
+  const settled = await waitForVerdict(
+    apiUrl,
+    key,
+    enqueued.runId,
+    timeoutMinutes * 60 * 1000,
+  )
+  if (!settled.ci) {
+    fail(
+      "The run finished but produced no gate report — the repo's analysis " +
+        "pipeline may predate the gate. Contact support@semfora.ai.",
     )
-  })
-
-  // Exit 20 = policy errors WITH a normal report; anything else nonzero is
-  // an analysis failure (mirror of the cloud pipeline's contract).
-  if (result.code !== 0 && result.code !== 20) {
-    fail(`Semfora analysis failed (exit ${result.code}).`)
   }
-  let report
-  try {
-    report = JSON.parse(result.stdout)
-  } catch {
-    fail("Semfora produced an unreadable report.")
-  }
+  const report = toReport(settled.ci)
 
-  const summaryMd = fs.existsSync(summaryPath)
-    ? fs.readFileSync(summaryPath, "utf8")
-    : ""
-  if (summaryMd) appendSummary(summaryMd)
+  if (report.summary_md) appendSummary(report.summary_md)
   for (const hit of report.rule_hits ?? []) {
     annotate(hit.severity === "error" ? "error" : "warning", {
       file: hit.file || undefined,
@@ -745,7 +751,6 @@ async function main() {
   // a warning, never a gate verdict — plumbing must not flip pass to fail.
   const reviewers = reviewerConfig()
   const token = input("github-token") || process.env.GITHUB_TOKEN || ""
-  const repoSlug = process.env.GITHUB_REPOSITORY || ""
   const canUsePr = Boolean(pr?.number && repoSlug && token)
   let waivedBy = null
 

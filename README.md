@@ -5,10 +5,16 @@ team's policy in `semfora.toml` — protected domains, edits to load-bearing
 code, new cross-module dependencies, complexity budgets — using graph
 analysis no per-file linter can do.
 
-**Your code never leaves your runner.** The engine analyzes locally; the only
-network calls are the license verification and (optionally) fetching the
-engine binary. Requires a Semfora license key — get one at
-[semfora.ai](https://semfora.ai).
+**Nothing runs on your runner.** The action is a thin client: it queues the
+gate run in Semfora's isolated analysis pipeline (the same one behind the
+semfora.ai dashboard), which clones the PR via your Semfora GitHub App
+connection, and polls for the verdict. No engine download, no checkout step,
+no `fetch-depth` plumbing — and the report the runner receives contains
+symbol names and numbers only, never source.
+
+Requirements: a Semfora license key, and the repository must be connected on
+[semfora.ai](https://semfora.ai) (the key must belong to the account that
+owns the repo — a key can never gate someone else's code).
 
 ## Usage
 
@@ -19,16 +25,13 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
-  contents: read
+  pull-requests: write   # report comment, inline findings, denial review
 
 jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0        # the gate diffs against the PR base commit
-      - uses: semfora-ai/semfora-action@v1
+      - uses: semfora-ai/semfora-action@v2
         with:
           semfora-key: ${{ secrets.SEMFORA_KEY }}
 ```
@@ -86,17 +89,13 @@ on:
     types: [submitted]          # re-run the gate when a reviewer approves
 
 permissions:
-  contents: read
-  pull-requests: write          # needed to request reviewers
+  pull-requests: write          # comments, reviews, reviewer requests
 
 jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: semfora-ai/semfora-action@v1
+      - uses: semfora-ai/semfora-action@v2
         with:
           semfora-key: ${{ secrets.SEMFORA_KEY }}
           required-reviewers: alice, bob, my-org/platform-team
@@ -143,10 +142,9 @@ threshold = 40
 
 | Input | Required | Default | Notes |
 |---|---|---|---|
-| `semfora-key` | yes | — | License key; store as a secret. Verified before every run. |
-| `base` | no | PR base sha | Ref/sha to gate against. |
-| `target-ref` | no | `HEAD` | `WORKING` gates uncommitted changes. |
-| `engine-path` | no | — | Pre-provisioned binary for air-gapped/self-hosted runners (key still verified). |
+| `semfora-key` | yes | — | License key; store as a secret. Verified (with repo entitlement) on every call. |
+| `base` | no | PR base sha | Sha to gate against. |
+| `poll-timeout-minutes` | no | `20` | How long to wait for the cloud run; raise for first-time indexes of very large repos. |
 | `api-url` | no | `https://semfora.ai` | Self-hosted deployments only (must be https). |
 | `pr-comment` | no | `on-findings` | Sticky PR comment with linked findings + graphs: `on-findings`, `always`, or `never`. Needs `pull-requests: write`. |
 | `line-comments` | no | `true` | Inline review comments on the lines the rules hit. Needs `pull-requests: write`. |
@@ -172,14 +170,17 @@ threshold = 40
 
 ## Security
 
-- **Your code never leaves the runner.** The engine analyzes locally; the
-  only outbound calls are license verification, the (optional) engine
-  download, and the GitHub API for reviewer requests.
-- The license key is only ever sent over https to `api-url` and is masked
-  in logs. Store it as a repository or organization secret.
-- Downloaded engine binaries are refused unless the verification response
-  includes a sha256 checksum, and the checksum is enforced before the
-  binary is ever executed. Air-gapped runners can pin `engine-path`
-  instead.
+- **Nothing executes on your runner and no source passes through it.**
+  Analysis happens in Semfora's ephemeral, isolated pipeline containers —
+  cloned via your GitHub App installation, deleted when the run ends (the
+  same source-protection contract as the semfora.ai dashboard). The gate
+  report the action receives is symbol names and numbers only.
+- **A key only gates its own repos.** Every API call verifies the license
+  key AND that the key's billing account owns the repository — invalid
+  keys, revoked keys, and other tenants' repos all get the same uniform
+  rejection.
+- The license key is only ever sent over https to `api-url` (POST bodies,
+  never URLs) and is masked in logs. Store it as a repository or
+  organization secret.
 - The action is dependency-free — no `node_modules`, no supply chain. One
   auditable file.
