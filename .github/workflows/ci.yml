@@ -1,0 +1,24 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check
+        run: node --check index.js
+      - name: Fails fast without a key
+        run: |
+          set +e
+          out=$(node index.js 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          [ $code -eq 1 ] && echo "$out" | grep -q "semfora-key input is required"

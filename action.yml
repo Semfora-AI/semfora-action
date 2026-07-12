@@ -35,14 +35,48 @@ inputs:
     description: "Semfora API base (self-hosted deployments only)."
     required: false
     default: "https://semfora.ai"
+  required-reviewers:
+    description: >-
+      Comma/space-separated GitHub usernames (and org/team slugs, e.g.
+      "my-org/platform") to request as reviewers on the PR. Users must be
+      contributors on the repo (collaborators) — each entry is validated and
+      people without repo access are skipped with a warning. Requires the
+      workflow to grant `pull-requests: write`.
+    required: false
+  request-reviewers-on:
+    description: >-
+      When to file the review request: "fail" (default — only when the gate
+      finds policy errors), "always", or "never".
+    required: false
+    default: "fail"
+  require-approval:
+    description: >-
+      "true" — a policy failure only passes once one of the required
+      reviewers approves the PR at its current head commit (stale approvals
+      don't count). Add the `pull_request_review: [submitted]` trigger so
+      the check re-runs when they approve; mark the check required in
+      branch protection to make these reviewers de-facto required.
+    required: false
+    default: "false"
+  github-token:
+    description: >-
+      Token for the reviewer API calls. Defaults to the workflow token;
+      only needed explicitly if you want reviewer requests to come from a
+      bot/app identity.
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   verdict:
-    description: '"pass" or "fail" — the gate verdict.'
+    description: '"pass" or "fail" — the gate verdict (before any waiver).'
   errors:
     description: "Number of error-severity policy findings."
   warnings:
     description: "Number of warning-severity policy findings."
+  waived:
+    description: >-
+      "true" when a policy failure was waived by a required reviewer's
+      approval of the current head commit.
 
 runs:
   using: "node20"
