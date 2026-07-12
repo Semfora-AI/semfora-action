@@ -58,17 +58,18 @@ inputs:
     default: "false"
   line-comments:
     description: >-
-      "true" (default) — post inline review comments on the exact lines the
-      policy rules hit (deduplicated across runs; hits outside the diff stay
-      in the gate report comment). Requires `pull-requests: write`.
+      "true" (default) — annotate the exact lines the policy rules hit,
+      attached to the single gate review (deduplicated across runs; hits
+      outside the diff stay in the gate report comment). Requires
+      `pull-requests: write`.
     required: false
     default: "true"
   request-changes:
     description: >-
-      "true" (default) — while the policy verdict is fail, keep a Changes
-      Requested review on the PR naming the restricted domains, and dismiss
-      it automatically once the gate passes or the failure is waived.
-      Requires `pull-requests: write`.
+      "true" (default) — while the policy verdict is fail, the gate review
+      is submitted as Changes Requested (one line naming the restricted
+      domains), and dismissed automatically once the gate passes or the
+      failure is waived. Requires `pull-requests: write`.
     required: false
     default: "true"
   pr-comment:

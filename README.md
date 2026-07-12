@@ -49,18 +49,18 @@ PR itself:
   bar chart** for symbols that blew their budget, and a **module dependency
   graph** of cross-module edges the PR adds (Mermaid — GitHub renders both
   natively). Tune with `pr-comment: on-findings | always | never`.
-- **Inline line comments** — each policy finding is commented on the exact
-  line it hit, with the rule, severity, domains, and the measured numbers
-  behind it (`cc=34 cc_before=12 …`). Deduplicated across runs; hits on
-  lines outside the diff stay in the report table (still linked). Disable
-  with `line-comments: "false"`.
-- **Policy denial** — when `semfora.toml` marks a domain protected at
-  `severity = "error"` and the PR touches it, the verdict is fail and the
-  action keeps a **Changes Requested review** on the PR naming the
-  restricted domains. It is dismissed automatically as soon as the gate
-  passes or the failure is waived. Disable with `request-changes: "false"`.
-  Combined with a required status check this is a hard deny: the config in
-  the repo decides, the action enforces.
+- **One gate review** — the verdict and the line annotations land as a
+  *single* review, the way a human reviewer's feedback does. Each policy
+  finding is annotated on the exact line it hit, with the rule, severity,
+  domains, and the measured numbers behind it (`cc=34 cc_before=12 …`) —
+  deduplicated across runs; hits on lines outside the diff stay in the
+  report table (still linked). When `semfora.toml` marks a domain protected
+  at `severity = "error"` and the PR touches it, that review is submitted
+  as **Changes Requested** with a one-line body naming the restricted
+  domains, and dismissed automatically as soon as the gate passes or the
+  failure is waived. Combined with a required status check this is a hard
+  deny: the config in the repo decides, the action enforces. Tune with
+  `line-comments: "false"` / `request-changes: "false"`.
 
 **Bot identity:** when the gate response includes a Semfora posting token
 (the default for repos connected via the Semfora GitHub App), everything

@@ -452,81 +452,111 @@ async function commentableLines(token, repo, prNumber) {
   return map
 }
 
-async function postLineComments(token, repo, pr, report) {
+/** New (deduplicated, diff-hunk-aware) inline comments for the rule hits. */
+async function buildInlineComments(token, repo, pr, report) {
   const hits = (report.rule_hits ?? []).filter((h) => h.file && h.line).slice(0, 25)
-  if (hits.length === 0) return
+  if (hits.length === 0) return []
   const commentable = await commentableLines(token, repo, pr.number)
   const existing = new Set(
     (await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/comments`, { maxPages: 5 }))
       .filter((c) => c.body?.includes(LINE_MARKER))
       .map((c) => `${c.path}:${c.line ?? c.original_line}`),
   )
-  let failures = 0
+  const comments = []
   for (const h of hits) {
     if (!commentable.get(h.file)?.has(h.line)) continue
     if (existing.has(`${h.file}:${h.line}`)) continue
     const evidence = formatEvidence(h.evidence)
-    const body = [
-      LINE_MARKER,
-      `**Semfora: ${h.rule}** (${h.severity})${h.groups?.length ? ` — domains: ${h.groups.join(", ")}` : ""}`,
-      "",
-      h.message,
-      evidence ? `\n\`${evidence}\`` : "",
-    ]
-      .filter(Boolean)
-      .join("\n")
-    const res = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/comments`, {
-      commit_id: pr.head?.sha,
+    comments.push({
       path: h.file,
       line: h.line,
       side: "RIGHT",
-      body,
+      body: [
+        LINE_MARKER,
+        `**Semfora: ${h.rule}** (${h.severity})${h.groups?.length ? ` — domains: ${h.groups.join(", ")}` : ""}`,
+        "",
+        h.message,
+        evidence ? `\n\`${evidence}\`` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
     })
-    if (!res.ok) failures++
   }
-  if (failures > 0) {
-    warn(
-      `Semfora could not place ${failures} inline comment(s) — they remain ` +
-        "in the gate report comment. The github-token needs `pull-requests: write`.",
-    )
-  }
+  return comments
 }
 
-// --- deny review (Changes Requested) ------------------------------------------------
+// --- the gate review ----------------------------------------------------------------
 
-async function syncDenyReview(token, repo, pr, denied, domains) {
+/**
+ * ONE review per verdict, not one message per finding: the deny verdict
+ * (Changes Requested) and the inline line comments ride the same review —
+ * the way a human reviewer's feedback lands — and the review is dismissed
+ * once the gate passes or the failure is waived. Full details live in the
+ * sticky report comment; the review body stays to one line.
+ */
+async function syncGateReview(token, repo, pr, report, { denied, domains, lineComments }) {
   const reviews = await ghPaged(token, `/repos/${repo}/pulls/${pr.number}/reviews`)
-  const active = reviews.filter(
+  const activeDeny = reviews.filter(
     (r) => r.state === "CHANGES_REQUESTED" && r.body?.includes(REVIEW_MARKER),
   )
-  if (denied) {
-    if (active.length > 0) return // one standing deny review is enough
-    const res = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/reviews`, {
-      event: "REQUEST_CHANGES",
-      body: [
-        REVIEW_MARKER,
-        "🚫 **Semfora Gate denied this pull request.**",
-        "",
-        domains.length > 0
-          ? `It edits restricted domain(s) protected by \`semfora.toml\`: **${domains.join(", ")}**.`
-          : "It violates error-severity rules in `semfora.toml`.",
-        "",
-        "Details are in the gate report comment and inline annotations. This review is dismissed automatically when the gate passes or the failure is waived.",
-      ].join("\n"),
-    })
-    if (!res.ok) {
-      warn(`Semfora could not submit the deny review (HTTP ${res.status}).`)
-    }
-  } else {
-    for (const r of active) {
-      const res = await gh(token, "PUT", `/repos/${repo}/pulls/${pr.number}/reviews/${r.id}/dismissals`, {
-        message: "Semfora gate passed (or the failure was waived) — dismissing the deny review.",
-      })
-      if (!res.ok) {
-        warn(`Semfora could not dismiss its deny review (HTTP ${res.status}).`)
-      }
+
+  if (!denied) {
+    for (const r of activeDeny) {
+      const res = await gh(
+        token,
+        "PUT",
+        `/repos/${repo}/pulls/${pr.number}/reviews/${r.id}/dismissals`,
+        {
+          message:
+            "Semfora gate passed (or the failure was waived) — dismissing the deny review.",
+        },
+      )
+      if (!res.ok) warn(`Semfora could not dismiss its deny review (HTTP ${res.status}).`)
     }
   }
+
+  const comments = lineComments ? await buildInlineComments(token, repo, pr, report) : []
+  const needDeny = denied && activeDeny.length === 0
+  if (!needDeny && comments.length === 0) return
+
+  const body = needDeny
+    ? [
+        REVIEW_MARKER,
+        `🚫 **Semfora Gate denied this pull request**${
+          domains.length > 0 ? ` — it edits restricted domain(s): **${domains.join(", ")}**` : ""
+        }. Findings are annotated inline; details are in the gate report comment. Dismissed automatically when the gate passes or is waived.`,
+      ].join("\n")
+    : `⚠️ **Semfora Gate** — ${comments.length} finding(s) annotated inline; details are in the gate report comment.`
+
+  const payload = {
+    ...(pr.head?.sha ? { commit_id: pr.head.sha } : {}),
+    event: needDeny ? "REQUEST_CHANGES" : "COMMENT",
+    body,
+    ...(comments.length ? { comments } : {}),
+  }
+  const res = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/reviews`, payload)
+  if (res.ok) return
+
+  if (needDeny && comments.length > 0) {
+    // A single out-of-range comment 422s the whole review — land the deny
+    // verdict alone; the findings stay linked in the report comment.
+    const retry = await gh(token, "POST", `/repos/${repo}/pulls/${pr.number}/reviews`, {
+      ...(pr.head?.sha ? { commit_id: pr.head.sha } : {}),
+      event: "REQUEST_CHANGES",
+      body,
+    })
+    if (retry.ok) {
+      warn(
+        `Semfora could not attach ${comments.length} inline comment(s) ` +
+          `(HTTP ${res.status}) — they remain in the gate report comment.`,
+      )
+      return
+    }
+  }
+  warn(
+    `Semfora could not submit the gate review (HTTP ${res.status}). The ` +
+      "github-token needs `pull-requests: write`.",
+  )
 }
 
 // --- required reviewers / approvals ---------------------------------------------------
@@ -790,23 +820,19 @@ async function main() {
   }
 
   if (canUsePr) {
-    // Inline comments on the exact lines the rules hit.
-    if ((input("line-comments") || "true").toLowerCase() !== "false") {
+    // One gate review: the deny verdict (Changes Requested) and the inline
+    // line comments ride a single review; dismissed on pass/waive.
+    const lineComments = (input("line-comments") || "true").toLowerCase() !== "false"
+    const requestChanges = (input("request-changes") || "true").toLowerCase() !== "false"
+    if (lineComments || requestChanges) {
       try {
-        await postLineComments(token, repoSlug, pr, report)
+        await syncGateReview(token, repoSlug, pr, report, {
+          denied: requestChanges && report.verdict === "fail" && !waivedBy,
+          domains: deniedDomains(report),
+          lineComments,
+        })
       } catch (e) {
-        warn(`Semfora inline comments failed: ${e.message}`)
-      }
-    }
-
-    // Deny review: Changes Requested while the policy verdict stands,
-    // dismissed once the gate passes or the failure is waived.
-    if ((input("request-changes") || "true").toLowerCase() !== "false") {
-      try {
-        const denied = report.verdict === "fail" && !waivedBy
-        await syncDenyReview(token, repoSlug, pr, denied, deniedDomains(report))
-      } catch (e) {
-        warn(`Semfora deny review failed: ${e.message}`)
+        warn(`Semfora gate review failed: ${e.message}`)
       }
     }
 
