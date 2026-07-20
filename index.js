@@ -193,6 +193,47 @@ async function waitForVerdict(apiUrl, key, runId, timeoutMs) {
 }
 
 /**
+ * Facts section: AST-proven properties this change introduces, AI-triaged
+ * server-side. Kept facts render as rows; noise-verdict facts collapse to
+ * one count line so a reviewer can trust the list without wading through
+ * receiver-type misreads. Controlled by the `facts` input.
+ */
+function factsSection(report, repo, headSha) {
+  const all = report.facts_introduced ?? []
+  if (all.length === 0) return ""
+  const kept = all.filter((f) => f.aiVerdict !== "noise").slice(0, 20)
+  const noise = all.length - all.filter((f) => f.aiVerdict !== "noise").length
+  if (kept.length === 0 && noise === 0) return ""
+  const critMark = (c) =>
+    c === "high" ? "🛑" : c === "medium" ? "⚠️" : "🔎"
+  const rows = kept.map((f) => {
+    const location =
+      f.file && headSha
+        ? `[\`${f.file}:${f.line}\`](${codeLink(repo, headSha, f.file, f.line)})`
+        : f.file
+          ? `\`${f.file}:${f.line}\``
+          : ""
+    const note = f.aiNote ? ` _(${f.aiNote.replace(/\|/g, "\\|")})_` : ""
+    return `| ${critMark(f.criticality)} | ${f.kind} | ${location} | ${f.symbol ? `\`${f.symbol}\`` : "—"} | ${f.detail.replace(/\|/g, "\\|")}${note} |`
+  })
+  const suppressed =
+    noise > 0
+      ? `\n_${noise} more fact(s) marked noise by AI triage and hidden._`
+      : ""
+  return [
+    "#### Facts introduced",
+    "",
+    "_AST-proven properties the target version has and the base does not — deterministic detections, AI-triaged for relevance._",
+    "",
+    "| | Fact | Location | Symbol | Detail |",
+    "|---|---|---|---|---|",
+    ...rows,
+    suppressed,
+    "",
+  ].join("\n")
+}
+
+/**
  * Adapt the API's distilled gate report (camelCase CiMetrics) to the shape
  * the renderer below consumes (the engine's snake_case ci_report — kept so
  * the entire PR-surface renderer is unchanged from the local-run era).
@@ -223,6 +264,11 @@ function toReport(ci) {
           pairs: ci.couplingDelta.pairs ?? [],
         }
       : undefined,
+    // AST-proven facts this change introduces, AI-triaged server-side
+    // (aiVerdict "noise" = suppressed by default). Absent on older runs.
+    facts_introduced: Array.isArray(ci.factsIntroduced)
+      ? ci.factsIntroduced
+      : [],
     summary_md: ci.summaryMd ?? "",
   }
 }
@@ -613,6 +659,7 @@ function commentBody(report, repo, headSha, waiver, approvalHint, extras = {}) {
     qualitySection(report, repoVital),
     domainsSection(report, domainColors),
     findingsTable(report, repo, headSha),
+    extras.showFacts !== false ? factsSection(report, repo, headSha) : "",
     complexityChart(report),
     couplingGraph(report),
     `<sub>Semantic PR gate by <a href="https://semfora.ai">semfora.ai</a> — analyzed in Semfora's isolated pipeline via your GitHub App connection; this report contains symbol names and numbers only, never source.</sub>`,
@@ -1348,6 +1395,7 @@ async function main() {
             commentBody(report, repoSlug, pr.head?.sha, waiver, approvalHint, {
               domainColors,
               repoVital,
+              showFacts: (input("facts") || "on").toLowerCase() !== "off",
             }),
           )
         }
