@@ -90,7 +90,8 @@ inputs:
       "on" (default) — the report comment includes the "Facts introduced"
       section: AST-proven properties this change adds (empty catch handlers,
       returns in finally, exit-free loops, per-iteration IO, identical
-      branches…), AI-triaged server-side so receiver-type misreads and
+      branches, self-comparisons, literal if-conditions, discarded async
+      promises…), AI-triaged server-side so receiver-type misreads and
       test-scaffolding noise stay hidden. "off" removes the section.
     required: false
     default: "on"
