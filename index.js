@@ -21,8 +21,11 @@
 //      (::error/::warning file=), and action outputs.
 //   4. PR surfaces (optional, all degrade to warnings — they can never flip
 //      the gate verdict):
-//      - sticky comment with linked findings, a complexity chart, and a
-//        cross-module dependency graph (Mermaid — GitHub renders it);
+//      - sticky comment with linked findings, the domains the PR touches
+//        (colored chips — the SAME deterministic colors semfora.ai assigns
+//        those domains, see the ported registry below), a quality-impact
+//        delta, a complexity chart, and a cross-module dependency graph
+//        (Mermaid — GitHub renders it);
 //      - inline review comments on the exact lines the rules hit;
 //      - a Changes Requested review when policy denies the PR (restricted
 //        domains in semfora.toml), dismissed automatically once the gate
@@ -31,6 +34,13 @@
 //        contributors, and let an approval of the current head commit waive
 //        a policy failure. require-approval: "admin" restricts the waiver
 //        to repo admins.
+//      - require-reason: keep a failing gate red until someone explains the
+//        change in a PR comment mentioning @semfora (PR author or a repo
+//        collaborator). The comment re-runs the gate (issue_comment runs
+//        attach their checks to the DEFAULT branch, so the comment run only
+//        re-triggers the failed pull_request run — the verdict flips in PR
+//        context), and the accepted reason is persisted to semfora.ai
+//        alongside the denied domains / quality regression it justifies.
 // ---------------------------------------------------------------------------
 
 const fs = require("node:fs")
@@ -197,9 +207,19 @@ function toReport(ci) {
     rule_hits_total: ci.ruleHitsTotal ?? (ci.ruleHits?.length || 0),
     files_changed: ci.filesChanged ?? 0,
     symbols_changed: ci.symbolsChanged ?? 0,
+    groups_touched: Array.isArray(ci.groupsTouched)
+      ? ci.groupsTouched
+          .map((g) => ({
+            name: typeof g?.name === "string" ? g.name : "",
+            symbols_changed: g?.symbolsChanged ?? 0,
+          }))
+          .filter((g) => g.name)
+      : [],
     coupling_delta: ci.couplingDelta
       ? {
           new_edges: ci.couplingDelta.newEdges ?? 0,
+          removed_edges: ci.couplingDelta.removedEdges ?? 0,
+          net_change: ci.couplingDelta.netChange ?? 0,
           pairs: ci.couplingDelta.pairs ?? [],
         }
       : undefined,
@@ -271,6 +291,116 @@ function mermaidStr(s) {
   return `"${String(s).replace(/"/g, "'")}"`
 }
 
+// --- domain identity colors (ported from semfora-web domain-chip.tsx) ----------
+//
+// Every domain gets a GENERATED color: golden-angle hue distribution in
+// OKLCH, anchored at the brand emerald, with fixed lightness/chroma so all
+// domain accents sit in one muted band. The registry is deterministic per
+// repo — the canonical domain list (vended by /api/gate/status from the
+// repo's semfora.toml groups) claims hues in sorted order, extra domains
+// extend the sequence — so a domain is the SAME color on this PR comment as
+// on every semfora.ai dashboard page. Constants and ordering rules must stay
+// in lockstep with semfora-web/src/components/sentry/domain-chip.tsx.
+
+/** Golden angle: consecutive indices land far apart on the hue wheel. */
+const GOLDEN_ANGLE = 137.508
+/** Brand emerald (#15BA81) sits near hue 166 in OKLCH. */
+const BASE_HUE = 166
+
+/** Hue for the nth canonical domain. */
+function domainHue(index) {
+  return (BASE_HUE + index * GOLDEN_ANGLE) % 360
+}
+
+/**
+ * The web's one accent band is oklch(0.63 0.11 hue); GitHub markdown and
+ * Mermaid want hex, so convert OKLCH → linear sRGB → gamma sRGB here. At
+ * this lightness/chroma every hue is inside the sRGB gamut, so the clamp is
+ * a formality and the hex is the same color the dashboard renders.
+ */
+function hueToHex(hue) {
+  const rad = (hue * Math.PI) / 180
+  const L = 0.63
+  const a = 0.11 * Math.cos(rad)
+  const b = 0.11 * Math.sin(rad)
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3
+  const channels = [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  ]
+  const hex = channels
+    .map((c) => {
+      const lin = Math.min(1, Math.max(0, c))
+      const srgb = lin <= 0.0031308 ? 12.92 * lin : 1.055 * lin ** (1 / 2.4) - 0.055
+      return Math.round(srgb * 255)
+        .toString(16)
+        .padStart(2, "0")
+    })
+    .join("")
+  return `#${hex}`
+}
+
+/** Hash fallback for domains outside any registry: stable hue from the
+ *  name — the identical hash the web uses. */
+function domainFallbackColor(domain) {
+  let hash = 0
+  for (let i = 0; i < domain.length; i++) {
+    hash = (hash * 31 + domain.charCodeAt(i)) | 0
+  }
+  return hueToHex(Math.abs(hash) % 360)
+}
+
+function aliasLookup(key, colors) {
+  const exact = colors.get(key)
+  if (exact) return exact
+  for (const [name, color] of colors) {
+    if (key.includes(name) || name.includes(key)) return color
+  }
+  return undefined
+}
+
+/** The repo's canonical color registry: canonical domains (sorted) claim
+ *  hues first, extra domains extend the sequence. */
+function canonicalDomainColors(groupNames, extraDomains = []) {
+  const colors = new Map()
+  const canonical = [...new Set(groupNames.map((n) => n.toLowerCase()))].sort()
+  canonical.forEach((name, i) => {
+    colors.set(name, hueToHex(domainHue(i)))
+  })
+  const extras = [...new Set(extraDomains.map((d) => d.toLowerCase()))]
+    .filter((d) => !aliasLookup(d, colors))
+    .sort()
+  extras.forEach((name, i) => {
+    colors.set(name, hueToHex(domainHue(canonical.length + i)))
+  })
+  return colors
+}
+
+/** Resolve a domain's color: exact registry hit, fuzzy alias, then the
+ *  hash fallback. */
+function domainColorFor(domain, colors) {
+  if (colors) {
+    const hit = aliasLookup(domain.toLowerCase(), colors)
+    if (hit) return hit
+  }
+  return domainFallbackColor(domain)
+}
+
+/** Registry for this report: the repo's canonical domains claim hues in
+ *  sorted order (matching the dashboard); domains that appear only in this
+ *  report extend the sequence. */
+function buildDomainColors(report, canonicalDomains) {
+  const extras = new Set()
+  for (const g of report.groups_touched ?? []) extras.add(g.name)
+  for (const h of report.rule_hits ?? []) {
+    for (const d of h.groups ?? []) extras.add(d)
+  }
+  return canonicalDomainColors(canonicalDomains, [...extras])
+}
+
 /** Restricted domains behind error-severity `protected` hits. */
 function deniedDomains(report) {
   const domains = new Set()
@@ -316,6 +446,76 @@ function findingsTable(report, repo, headSha) {
     more,
     "",
   ].join("\n")
+}
+
+/**
+ * The domains this PR touches, as colored chips — Mermaid nodes whose fill
+ * is each domain's canonical color, so the chips match the semfora.ai
+ * dashboard exactly.
+ */
+function domainsSection(report, colors) {
+  const touched = report.groups_touched ?? []
+  if (touched.length === 0) return ""
+  const shown = touched.slice(0, 12)
+  const lines = ["```mermaid", "graph LR"]
+  shown.forEach((g, i) => {
+    const color = domainColorFor(g.name, colors)
+    const label = `${g.name} · ${g.symbols_changed} symbol${g.symbols_changed === 1 ? "" : "s"}`
+    lines.push(`  d${i}(${mermaidStr(label)}):::d${i}`)
+    lines.push(`  classDef d${i} fill:${color},stroke:${color},color:#fff`)
+  })
+  lines.push("```")
+  const more =
+    touched.length > shown.length
+      ? `\n_…and ${touched.length - shown.length} more domain(s)._`
+      : ""
+  return ["#### Domains touched", "", ...lines, more, ""].filter(Boolean).join("\n")
+}
+
+function fmtSigned(n) {
+  return n > 0 ? `+${n}` : `${n}`
+}
+
+/** Summed cognitive-complexity increase across over-budget symbols. */
+function complexityDeltaOf(report) {
+  return (report.rule_hits ?? [])
+    .filter((h) => h.rule === "complexity" && h.evidence?.cc !== undefined)
+    .reduce((sum, h) => sum + (h.evidence.cc - (h.evidence.cc_before ?? 0)), 0)
+}
+
+/**
+ * The PR's measured quality delta over its base — cross-module coupling and
+ * cognitive complexity — plus the repo's current Vital Score (from the
+ * latest default-branch analysis) as context. Only renders rows the data
+ * actually supports; a PR with no measured movement gets no section.
+ */
+function qualitySection(report, repoVital) {
+  const rows = []
+  const cd = report.coupling_delta
+  if (cd && (cd.new_edges || cd.removed_edges || cd.net_change)) {
+    const arrow = cd.net_change > 0 ? "▲" : cd.net_change < 0 ? "▼" : "—"
+    rows.push(
+      `| Cross-module coupling | ${arrow} ${fmtSigned(cd.net_change)} ref(s) · ${cd.new_edges} new edge(s), ${cd.removed_edges} removed |`,
+    )
+  }
+  const compHits = (report.rule_hits ?? []).filter(
+    (h) => h.rule === "complexity" && h.evidence?.cc !== undefined,
+  )
+  const ccDelta = complexityDeltaOf(report)
+  if (compHits.length > 0 && ccDelta !== 0) {
+    rows.push(
+      `| Cognitive complexity | ${ccDelta > 0 ? "▲" : "▼"} ${fmtSigned(ccDelta)} across ${compHits.length} symbol(s) over budget |`,
+    )
+  }
+  if (repoVital) {
+    rows.push(
+      `| Codebase Vital Score | ${Math.round(repoVital.svs)}${repoVital.grade ? ` (${repoVital.grade})` : ""} on the default branch |`,
+    )
+  }
+  if (rows.length === 0) return ""
+  return ["#### Quality impact", "", "| Metric | This PR |", "|---|---|", ...rows, ""].join(
+    "\n",
+  )
 }
 
 /** Before/after cognitive-complexity bar chart for complexity-rule hits. */
@@ -367,11 +567,19 @@ function couplingGraph(report) {
   ].join("\n")
 }
 
-function commentBody(report, repo, headSha, waivedBy, approvalHint) {
+function commentBody(report, repo, headSha, waiver, approvalHint, extras = {}) {
+  const { domainColors, repoVital } = extras
+  const w = waiver ?? {}
+  const waivedVia = [
+    w.approvedBy ? `approved by @${w.approvedBy}` : "",
+    w.reason ? `reason from @${w.reason.author}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ")
   const status =
     report.verdict === "fail"
-      ? waivedBy
-        ? `⚠️ failed — waived by @${waivedBy}'s approval`
+      ? w.waived
+        ? `⚠️ failed — waived (${waivedVia})`
         : "❌ failed"
       : "✅ passed"
   const parts = [
@@ -382,13 +590,21 @@ function commentBody(report, repo, headSha, waivedBy, approvalHint) {
     "",
   ]
   const denied = deniedDomains(report)
-  if (report.verdict === "fail" && denied.length > 0 && !waivedBy) {
+  if (report.verdict === "fail" && denied.length > 0 && !w.waived) {
     parts.push(
       `> 🚫 **Denied by policy** — this PR edits restricted domain(s): **${denied.join(", ")}**. \`semfora.toml\` marks them protected at error severity, so the gate blocks this PR.${approvalHint}`,
       "",
     )
   }
+  if (report.verdict === "fail" && !w.waived && w.needsReason && !w.reason) {
+    parts.push(
+      `> ✍️ **Reason required** — comment \`@semfora <why this change is needed>\` on this PR (PR author or a repo collaborator, ${MIN_REASON_LENGTH}+ characters). The comment re-runs the gate, and the accepted reason is recorded on semfora.ai with the domains and quality deltas it covers.`,
+      "",
+    )
+  }
   parts.push(
+    qualitySection(report, repoVital),
+    domainsSection(report, domainColors),
     findingsTable(report, repo, headSha),
     complexityChart(report),
     couplingGraph(report),
@@ -559,6 +775,203 @@ async function syncGateReview(token, repo, pr, report, { denied, domains, lineCo
   )
 }
 
+// --- change reasons (require-reason) ---------------------------------------------------
+
+const REASON_MENTION = /@semfora\b/i
+const MIN_REASON_LENGTH = 10
+/** Comment authors who may unblock the gate with a reason (plus the PR
+ *  author — on fork PRs the outside contributor IS the one who must
+ *  explain the change). */
+const REASON_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"])
+
+/**
+ * Extract the reason from a comment body. Returns null when the comment is
+ * not addressed to @semfora at all, "" when it mentions @semfora but says
+ * nothing usable (a bare tag is not a reason), else the reason text with
+ * the mention stripped.
+ */
+function parseReason(body) {
+  if (!REASON_MENTION.test(body ?? "")) return null
+  const text = String(body)
+    .replace(/@semfora\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return text.length >= MIN_REASON_LENGTH ? text : ""
+}
+
+function qualifiedCommenter(comment, pr) {
+  const login = comment?.user?.login
+  if (!login || comment?.user?.type === "Bot") return false
+  return (
+    login === pr?.user?.login ||
+    REASON_ASSOCIATIONS.has(comment?.author_association)
+  )
+}
+
+/**
+ * The newest qualifying @semfora reason comment on the PR, or null. Our own
+ * report comment is skipped by marker; bots never qualify.
+ */
+async function findReasonComment(token, repo, pr) {
+  const comments = await ghPaged(token, `/repos/${repo}/issues/${pr.number}/comments`)
+  let best = null
+  for (const c of comments) {
+    if (c.body?.includes(COMMENT_MARKER)) continue
+    const reason = parseReason(c.body ?? "")
+    if (!reason) continue
+    if (!qualifiedCommenter(c, pr)) continue
+    if (!best || Date.parse(c.created_at ?? 0) >= Date.parse(best.created_at ?? 0)) {
+      best = { reason, author: c.user.login, url: c.html_url ?? "", created_at: c.created_at }
+    }
+  }
+  return best
+}
+
+/**
+ * Which conditions unblock a failing verdict, and whether they all hold.
+ * Every CONFIGURED waiver must be satisfied: with require-approval and
+ * require-reason both on, a failure needs the approval AND the reason.
+ * With neither configured a failure is simply a failure.
+ */
+function resolveWaiver({ verdict, approvalMode, requireReason, approvedBy, reason }) {
+  const missing = []
+  if (approvalMode !== "off" && !approvedBy) missing.push("approval")
+  if (requireReason && !reason) missing.push("reason")
+  const configured = approvalMode !== "off" || requireReason
+  return {
+    waived: verdict === "fail" && configured && missing.length === 0,
+    missing,
+    approvedBy: approvedBy ?? null,
+    reason: reason ?? null,
+    needsReason: requireReason,
+  }
+}
+
+/** "owner/repo/.github/workflows/gate.yml@refs/heads/main" → workflow path. */
+function workflowPathFromRef(ref) {
+  const path = String(ref ?? "").split("@")[0]
+  const parts = path.split("/")
+  return parts.length > 2 ? parts.slice(2).join("/") : ""
+}
+
+/**
+ * Best-effort: persist the accepted reason to semfora.ai, tied to the gate
+ * run and to what it justified (denied domains, coupling/complexity
+ * regression — names and numbers; the reason text is the commenter's own
+ * words). Never affects the verdict.
+ */
+async function postReason(apiUrl, key, payload) {
+  try {
+    const res = await fetchWithRetry(
+      `${apiUrl.replace(/\/$/, "")}/api/gate/reason`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key, ...payload }),
+      },
+      { attempts: 2 },
+    )
+    // Older servers 404 this path into the SPA (200 + HTML) — only a JSON
+    // { ok: true } counts as recorded.
+    const ack = res.ok ? await res.json().catch(() => null) : null
+    if (ack?.ok) {
+      notice(`Semfora recorded the change reason from @${payload.author} on semfora.ai.`)
+    } else {
+      warn(`Semfora could not record the change reason (HTTP ${res.status}).`)
+    }
+  } catch (e) {
+    warn(`Semfora could not record the change reason: ${e.message}`)
+  }
+}
+
+/**
+ * issue_comment run: not a gate run. Validate the @semfora reason comment,
+ * then re-run the failed pull_request run of THIS workflow at the PR head —
+ * that re-run executes in PR context (where check runs actually attach to
+ * the PR; issue_comment checks land on the default branch), finds the
+ * reason comment, waives the failure, and persists the reason. This run
+ * itself always exits green — a red comment-run check would only confuse.
+ */
+async function runFromReasonComment(event, repoSlug) {
+  if ((input("require-reason") || "false").toLowerCase() !== "true") {
+    notice("Semfora: issue_comment received but require-reason is off — nothing to do.")
+    return
+  }
+  const reason = parseReason(event.comment?.body ?? "")
+  if (reason === null) return // not addressed to @semfora
+  if (reason === "") {
+    notice(
+      `Semfora: the @semfora comment needs an actual reason (at least ${MIN_REASON_LENGTH} characters) to unblock the gate.`,
+    )
+    return
+  }
+  const token = input("github-token") || process.env.GITHUB_TOKEN || ""
+  if (!token) {
+    warn("Semfora: no github-token available on the issue_comment run — cannot re-run the gate.")
+    return
+  }
+  const prNumber = event.issue?.number
+  const prRes = await gh(token, "GET", `/repos/${repoSlug}/pulls/${prNumber}`)
+  if (!prRes.ok) {
+    warn(`Semfora could not load PR #${prNumber} (HTTP ${prRes.status}).`)
+    return
+  }
+  const pr = await prRes.json()
+  if (!qualifiedCommenter(event.comment, pr)) {
+    notice(
+      `Semfora: @${event.comment?.user?.login ?? "?"} is neither the PR author nor a repo collaborator — the reason does not unblock the gate.`,
+    )
+    return
+  }
+  const wfPath = workflowPathFromRef(process.env.GITHUB_WORKFLOW_REF)
+  const runsRes = await gh(
+    token,
+    "GET",
+    `/repos/${repoSlug}/actions/runs?event=pull_request&head_sha=${encodeURIComponent(pr.head?.sha ?? "")}&per_page=100`,
+  )
+  if (!runsRes.ok) {
+    warn(
+      `Semfora could not list workflow runs (HTTP ${runsRes.status}) — the ` +
+        "issue_comment job needs `actions: write` in its permissions.",
+    )
+    return
+  }
+  const runs = ((await runsRes.json()).workflow_runs ?? []).filter(
+    (r) => !wfPath || r.path === wfPath,
+  )
+  const latest = runs[0] // the API lists newest first
+  if (!latest) {
+    warn(
+      "Semfora: no pull_request gate run found at the PR head — the reason " +
+        "will apply on the next gate run.",
+    )
+    return
+  }
+  if (latest.status !== "completed") {
+    notice("Semfora: the gate is already running — it will pick up this reason.")
+    return
+  }
+  if (latest.conclusion === "success") {
+    notice("Semfora: the gate already passes — nothing to re-run.")
+    return
+  }
+  const rerun = await gh(
+    token,
+    "POST",
+    `/repos/${repoSlug}/actions/runs/${latest.id}/rerun-failed-jobs`,
+  )
+  if (rerun.ok) {
+    notice(
+      `Semfora: reason received from @${event.comment.user.login} — re-running the gate to apply it.`,
+    )
+  } else {
+    warn(
+      `Semfora could not re-run the gate (HTTP ${rerun.status}). The ` +
+        "issue_comment job needs `actions: write` in its permissions.",
+    )
+  }
+}
+
 // --- required reviewers / approvals ---------------------------------------------------
 
 /**
@@ -725,9 +1138,21 @@ async function main() {
   }
 
   const event = readEvent()
-  const pr = event.pull_request
   const repoSlug = process.env.GITHUB_REPOSITORY || ""
   if (!repoSlug) fail("GITHUB_REPOSITORY is not set — not a GitHub Actions run?")
+
+  // issue_comment runs are reason-relay runs, never gate runs: validate the
+  // @semfora comment and re-trigger the failed pull_request run (checks from
+  // comment runs attach to the default branch, so the verdict must flip in
+  // PR context). Always exits green.
+  if (event.comment && event.issue) {
+    // Comments on plain issues are none of our business — but they must
+    // exit green, not fall through to "no base to gate against".
+    if (event.issue.pull_request) await runFromReasonComment(event, repoSlug)
+    return
+  }
+
+  const pr = event.pull_request
   const base = input("base") || pr?.base?.sha || ""
   if (!base) {
     fail(
@@ -764,6 +1189,18 @@ async function main() {
     )
   }
   const report = toReport(settled.ci)
+
+  // Canonical domain list + repo Vital Score, vended by the status endpoint
+  // (newer servers only — everything below degrades to the hash-fallback
+  // colors and no score row when absent).
+  const canonicalDomains = Array.isArray(settled.domains)
+    ? settled.domains.filter((d) => typeof d === "string" && d)
+    : []
+  const repoVital =
+    settled.repoVital && typeof settled.repoVital.svs === "number"
+      ? { svs: settled.repoVital.svs, grade: String(settled.repoVital.grade ?? "") }
+      : null
+  const domainColors = buildDomainColors(report, canonicalDomains)
 
   if (report.summary_md) appendSummary(report.summary_md)
   for (const hit of report.rule_hits ?? []) {
@@ -819,6 +1256,48 @@ async function main() {
     }
   }
 
+  // require-reason: a failing gate stays red until a qualifying PR comment
+  // mentions @semfora with the reason for the change.
+  const requireReason = (input("require-reason") || "false").toLowerCase() === "true"
+  let reasonInfo = null
+  if (requireReason && report.verdict === "fail") {
+    if (!canUsePr) {
+      warn(
+        "Semfora: require-reason is set but this is not a pull request run " +
+          "(or no github-token is available) — skipped.",
+      )
+    } else {
+      try {
+        reasonInfo = await findReasonComment(token, repoSlug, pr)
+      } catch (e) {
+        warn(`Semfora reason lookup failed: ${e.message}`)
+      }
+    }
+  }
+
+  const waiver = resolveWaiver({
+    verdict: report.verdict,
+    approvalMode: reviewers?.approvalMode ?? "off",
+    requireReason,
+    approvedBy: waivedBy,
+    reason: reasonInfo,
+  })
+
+  // Persist the accepted reason with what it justifies — denied domains and
+  // the measured regression. Best-effort; upserted by runId server-side.
+  if (reasonInfo) {
+    await postReason(apiUrl, key, {
+      runId: enqueued.runId,
+      reason: reasonInfo.reason.slice(0, 2000),
+      author: reasonInfo.author,
+      commentUrl: reasonInfo.url || undefined,
+      headSha: headSha || undefined,
+      domains: deniedDomains(report),
+      couplingNet: report.coupling_delta?.net_change ?? 0,
+      complexityDelta: complexityDeltaOf(report),
+    })
+  }
+
   if (canUsePr) {
     // One gate review: the deny verdict (Changes Requested) and the inline
     // line comments ride a single review; dismissed on pass/waive.
@@ -827,7 +1306,7 @@ async function main() {
     if (lineComments || requestChanges) {
       try {
         await syncGateReview(token, repoSlug, pr, report, {
-          denied: requestChanges && report.verdict === "fail" && !waivedBy,
+          denied: requestChanges && report.verdict === "fail" && !waiver.waived,
           domains: deniedDomains(report),
           lineComments,
         })
@@ -859,7 +1338,10 @@ async function main() {
             repoSlug,
             pr.number,
             existing,
-            commentBody(report, repoSlug, pr.head?.sha, waivedBy, approvalHint),
+            commentBody(report, repoSlug, pr.head?.sha, waiver, approvalHint, {
+              domainColors,
+              repoVital,
+            }),
           )
         }
       } catch (e) {
@@ -871,19 +1353,33 @@ async function main() {
   setOutput("verdict", report.verdict ?? "pass")
   setOutput("errors", report.errors ?? 0)
   setOutput("warnings", report.warnings ?? 0)
-  setOutput("waived", waivedBy ? "true" : "false")
+  setOutput("waived", waiver.waived ? "true" : "false")
   setOutput("denied-domains", deniedDomains(report).join(","))
+  setOutput(
+    "domains-touched",
+    (report.groups_touched ?? []).map((g) => g.name).join(","),
+  )
+  // Outputs are single-line: collapse whitespace and cap the reason.
+  setOutput(
+    "reason",
+    reasonInfo ? reasonInfo.reason.replace(/\s+/g, " ").slice(0, 500) : "",
+  )
+  setOutput("reason-author", reasonInfo ? reasonInfo.author : "")
 
   if (report.verdict === "fail") {
-    if (waivedBy) {
+    if (waiver.waived) {
+      const via = [
+        waiver.approvedBy ? `@${waiver.approvedBy}'s approval` : "",
+        waiver.reason ? `@${waiver.reason.author}'s reason` : "",
+      ]
+        .filter(Boolean)
+        .join(" and ")
       appendSummary(
-        `> ✅ **Waived** — ${report.errors} policy error(s) approved by @${waivedBy} at the current head commit.`,
+        `> ✅ **Waived** — ${report.errors} policy error(s) waived by ${via}.`,
       )
-      notice(
-        `Semfora gate: ${report.errors} policy error(s) waived by @${waivedBy}'s approval.`,
-      )
+      notice(`Semfora gate: ${report.errors} policy error(s) waived by ${via}.`)
     } else {
-      const unblock =
+      const approvalUnblock =
         reviewers?.approvalMode === "admin"
           ? " An approval of the current head commit from a repo admin waives this failure — the check re-runs on review via the pull_request_review trigger."
           : reviewers?.approvalMode === "reviewers"
@@ -892,9 +1388,16 @@ async function main() {
                 ...reviewers.teams.map((t) => `team ${t}`),
               ].join(", ")}) waives this failure — the check re-runs on review via the pull_request_review trigger.`
             : ""
+      const reasonUnblock =
+        requireReason && !reasonInfo
+          ? ' A PR comment "@semfora <why this change is needed>" (PR author' +
+            " or a repo collaborator) unblocks it — the comment re-runs the" +
+            " gate via the issue_comment trigger and the reason is recorded" +
+            " on semfora.ai."
+          : ""
       fail(
         `Semfora gate failed: ${report.errors} policy error(s), ` +
-          `${report.warnings} warning(s). See the step summary for details.${unblock}`,
+          `${report.warnings} warning(s). See the step summary for details.${approvalUnblock}${reasonUnblock}`,
       )
     }
   }
@@ -904,4 +1407,28 @@ async function main() {
   )
 }
 
-main().catch((e) => fail(e.message))
+if (require.main === module) {
+  main().catch((e) => fail(e.message))
+}
+
+// Pure helpers exported for test.js only — the Actions runtime always enters
+// through main() above (`runs.main: index.js`), so requiring this file in a
+// test never talks to the network.
+module.exports = {
+  domainHue,
+  hueToHex,
+  domainFallbackColor,
+  canonicalDomainColors,
+  domainColorFor,
+  buildDomainColors,
+  toReport,
+  deniedDomains,
+  domainsSection,
+  qualitySection,
+  commentBody,
+  parseReason,
+  qualifiedCommenter,
+  resolveWaiver,
+  workflowPathFromRef,
+  complexityDeltaOf,
+}

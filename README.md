@@ -43,12 +43,23 @@ PR itself:
 
 - **Sticky report comment** — one comment per PR, edited in place on every
   run (pushes never pile up new comments; a red comment refreshes to green
-  once the PR is fixed). It contains a findings table where every location
-  **links to the exact line at the PR's head commit**, plus two generated
-  graphs when the data warrants them: a before/after **cognitive-complexity
-  bar chart** for symbols that blew their budget, and a **module dependency
-  graph** of cross-module edges the PR adds (Mermaid — GitHub renders both
-  natively). Tune with `pr-comment: on-findings | always | never`.
+  once the PR is fixed). It contains:
+  - a **quality impact** table: the PR's measured cross-module coupling
+    delta, its cognitive-complexity delta, and the repo's current **Vital
+    Score** on the default branch for context;
+  - the **domains the PR touches** as colored chips — each domain rendered
+    in the *same deterministic color* semfora.ai assigns it on every
+    dashboard page (the action ports the dashboard's golden-angle OKLCH
+    registry and builds it from the canonical domain list the gate API
+    vends), with the number of changed symbols per domain;
+  - a findings table where every location **links to the exact line at the
+    PR's head commit**;
+  - two generated graphs when the data warrants them: a before/after
+    **cognitive-complexity bar chart** for symbols that blew their budget,
+    and a **module dependency graph** of cross-module edges the PR adds
+    (Mermaid — GitHub renders all of it natively).
+
+  Tune with `pr-comment: on-findings | always | never`.
 - **One gate review** — the verdict and the line annotations land as a
   *single* review, the way a human reviewer's feedback does. Each policy
   finding is annotated on the exact line it hit, with the rule, severity,
@@ -120,6 +131,56 @@ Notes:
 - Reviewer plumbing can never flip a passing gate to failing — any error in
   it degrades to a warning.
 
+## Require a reason for the change
+
+With `require-reason: "true"` (off by default), a failing gate stays red
+until someone **explains the change**: a PR comment mentioning `@semfora`
+with the reason (10+ characters), from the **PR author or a repo
+collaborator** — on fork PRs that means the outside contributor themselves
+can unblock by explaining, no maintainer round-trip needed. Bots never
+qualify, and a bare `@semfora` tag is not a reason.
+
+The comment itself completes the loop:
+
+1. The `issue_comment` trigger runs the workflow. Checks from comment runs
+   attach to the *default branch*, not the PR — so this run never judges
+   anything; it validates the comment and **re-runs the failed
+   `pull_request` gate run** at the PR head (that's why it needs
+   `actions: write`).
+2. The re-run executes in PR context, finds the reason comment, and the
+   required check turns green.
+3. The accepted reason is **persisted to semfora.ai** for the repo, tied to
+   the gate run and to what it justified: the restricted domains edited and
+   the measured quality regression (coupling and complexity deltas) — so
+   every waived denial has a durable, attributable "why".
+
+```yaml
+name: Semfora Gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]            # "@semfora <reason>" re-runs the gate
+
+permissions:
+  pull-requests: write          # report comment, findings, reviews
+  actions: write                # the comment run re-triggers the gate run
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: semfora-ai/semfora-action@v2
+        with:
+          semfora-key: ${{ secrets.SEMFORA_KEY }}
+          require-reason: "true"
+```
+
+Combinable with `require-approval`: when both are set, a policy failure
+needs the approval **and** the reason before it passes. Reasons are not
+pinned to a commit — an explanation of intent survives follow-up pushes
+(unlike approvals, which expire with the head commit).
+
 ## Policy lives in your repo
 
 The same `semfora.toml` drives this action, the semfora.ai cloud gate, and
@@ -157,13 +218,17 @@ threshold = 40
 | `required-reviewers` | no | — | Usernames / `org/team` slugs to request as reviewers. Needs `pull-requests: write`. |
 | `request-reviewers-on` | no | `fail` | `fail`, `always`, or `never`. |
 | `require-approval` | no | `false` | `"true"` → a required reviewer must approve the head commit to waive a failure; `"admin"` → the approver must be a repo admin. |
+| `require-reason` | no | `false` | `"true"` → a failing gate stays red until a PR comment mentions `@semfora` with the reason (author or collaborator). Needs the `issue_comment` trigger + `actions: write`. The reason is recorded on semfora.ai. |
 | `github-token` | no | workflow token | Only set to use a bot/app identity for the review requests. |
 
 ## Outputs
 
 `verdict` (`pass`/`fail`, before any waiver), `errors`, `warnings`,
-`waived` (`true` when an approval waived a policy failure), and
-`denied-domains` (comma-separated restricted domains hit at error severity).
+`waived` (`true` when every configured waiver — approval and/or reason —
+was satisfied), `denied-domains` (comma-separated restricted domains hit
+at error severity), `domains-touched` (comma-separated domains whose
+symbols the PR changes, denied or not), `reason` (the accepted @semfora
+change reason, single line), and `reason-author` (who gave it).
 
 ## Exit behavior
 
@@ -188,4 +253,5 @@ threshold = 40
   never URLs) and is masked in logs. Store it as a repository or
   organization secret.
 - The action is dependency-free — no `node_modules`, no supply chain. One
-  auditable file.
+  auditable runtime file (`index.js`; `test.js` is dev-only and never runs
+  in your workflow).

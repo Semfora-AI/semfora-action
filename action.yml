@@ -56,6 +56,19 @@ inputs:
       check required in branch protection to make this binding.
     required: false
     default: "false"
+  require-reason:
+    description: >-
+      "true" — a failing gate stays red until someone explains the change in
+      a PR comment mentioning @semfora (at least 10 characters of reason;
+      accepted from the PR author or a repo collaborator, never bots). The
+      comment re-runs the gate via the issue_comment trigger (add it to this
+      workflow's `on:` and grant `actions: write`), the check turns green,
+      and the reason is recorded on semfora.ai together with the denied
+      domains and quality deltas it covers. Combinable with
+      require-approval — then a failure needs the approval AND the reason.
+      Off by default.
+    required: false
+    default: "false"
   line-comments:
     description: >-
       "true" (default) — annotate the exact lines the policy rules hit,
@@ -75,9 +88,11 @@ inputs:
   pr-comment:
     description: >-
       Post the gate report as a sticky PR comment (edited in place on each
-      run): "on-findings" (default — comment when there are errors or
-      warnings, and keep refreshing an existing comment), "always", or
-      "never". Requires `pull-requests: write`.
+      run): linked findings, the domains the PR touches (colored to match
+      the semfora.ai dashboard), the measured quality impact, and the
+      generated graphs. "on-findings" (default — comment when there are
+      errors or warnings, and keep refreshing an existing comment),
+      "always", or "never". Requires `pull-requests: write`.
     required: false
     default: "on-findings"
   github-token:
@@ -103,6 +118,16 @@ outputs:
     description: >-
       Comma-separated restricted domains hit at error severity (empty when
       none) — the domains that caused a policy denial.
+  domains-touched:
+    description: >-
+      Comma-separated domains (semfora.toml groups) whose symbols this PR
+      changes, denied or not (empty when the repo defines no groups).
+  reason:
+    description: >-
+      The accepted @semfora change reason (single line, capped at 500
+      chars; empty when none was given or require-reason is off).
+  reason-author:
+    description: "GitHub login of whoever provided the accepted reason."
 
 runs:
   using: "node20"

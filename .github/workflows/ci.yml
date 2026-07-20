@@ -14,6 +14,8 @@ jobs:
           node-version: 20
       - name: Syntax check
         run: node --check index.js
+      - name: Tests
+        run: node --test
       - name: Fails fast without a key
         run: |
           set +e
