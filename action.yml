@@ -112,8 +112,9 @@ outputs:
     description: "Number of warning-severity policy findings."
   waived:
     description: >-
-      "true" when a policy failure was waived by a qualified approval of
-      the current head commit.
+      "true" when a policy failure was waived — by a qualified approval of
+      the current head commit (require-approval), an accepted @semfora
+      change reason (require-reason), or both when both are configured.
   denied-domains:
     description: >-
       Comma-separated restricted domains hit at error severity (empty when
