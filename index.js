@@ -401,12 +401,19 @@ function buildDomainColors(report, canonicalDomains) {
   return canonicalDomainColors(canonicalDomains, [...extras])
 }
 
-/** Restricted domains behind error-severity `protected` hits. */
+/** Restricted domains behind error-severity `protected` hits. A hit's
+ *  `groups` lists EVERY group the symbol belongs to (broad module groups
+ *  like `server` included), so naming those as "restricted" accuses domains
+ *  the policy never protected. The group that actually fired is the one the
+ *  engine names in the hit message; fall back to `groups` only for engines
+ *  that predate that message format. */
 function deniedDomains(report) {
   const domains = new Set()
   for (const h of report.rule_hits ?? []) {
     if (h.rule === "protected" && h.severity === "error") {
-      for (const g of h.groups ?? []) domains.add(g)
+      const named = [...String(h.message ?? "").matchAll(/protected group '([^']+)'/g)]
+      if (named.length > 0) for (const m of named) domains.add(m[1])
+      else for (const g of h.groups ?? []) domains.add(g)
     }
   }
   return [...domains].sort()
